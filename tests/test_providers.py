@@ -17,7 +17,10 @@ def payload(**updates):
     data = {"name": "Apinex Luna", "provider": "Apinex",
             "base_url": "https://api.apinex.bond/v1", "model": "free/gpt-6-luna",
             "protocol": "chat_completions", "api_key": "secret-test-value",
-            "timeout": 60, "max_iterations": 12, "streaming": False}
+            "timeout": 60, "max_iterations": 12, "streaming": False,
+            "max_requests_per_window": 600, "request_window_seconds": 60,
+            "min_request_interval_seconds": 0, "retry_limit": 2,
+            "max_backoff_seconds": 30, "task_timeout_seconds": 900}
     data.update(updates)
     return data
 
@@ -39,6 +42,25 @@ def test_url_and_protocol_validation(tmp_path, monkeypatch):
     assert client.post("/api/providers", json=payload(base_url="file:///tmp")).status_code == 422
     assert client.post("/api/providers", json=payload(protocol="unknown")).status_code == 422
     assert client.post("/api/providers", json=payload(base_url="https://user:pass@example.com/v1")).status_code == 422
+
+
+def test_provider_pacing_settings_are_saved_and_validated(tmp_path, monkeypatch):
+    isolate(tmp_path, monkeypatch)
+    client = TestClient(main.app)
+    saved = client.post("/api/providers", json=payload(
+        max_requests_per_window=4, request_window_seconds=45,
+        min_request_interval_seconds=8, retry_limit=1,
+        max_backoff_seconds=20, task_timeout_seconds=600))
+    assert saved.status_code == 200
+    item = saved.json()
+    assert item["max_requests_per_window"] == 4
+    assert item["request_window_seconds"] == 45
+    assert item["min_request_interval_seconds"] == 8
+    assert item["retry_limit"] == 1
+    assert item["max_backoff_seconds"] == 20
+    assert item["task_timeout_seconds"] == 600
+    bad = client.post("/api/providers", json=payload(max_requests_per_window=0))
+    assert bad.status_code == 422
 
 
 def test_validation_errors_do_not_echo_api_keys():
@@ -362,6 +384,8 @@ def test_mocked_task_endpoint_persists_redacted_completed_task(tmp_path, monkeyp
     assert secret not in state["message"]
     assert secret not in str(seen)
     assert state["answer"] == "Task checked."
+    assert state["request_stats"]["attempted"] == 1
+    assert state["request_stats"]["successful"] == 1
 
 
 def test_local_web_guard_rejects_foreign_origin_and_host():

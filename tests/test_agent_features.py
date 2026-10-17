@@ -31,6 +31,276 @@ def provider(protocol="chat_completions", streaming=False):
     )
 
 
+def test_rate_defaults_and_retry_after_formats(tmp_path, monkeypatch):
+    isolate(tmp_path, monkeypatch)
+    assert providers.rate_settings({"provider": "Apinex", "model": "free/gpt-6-luna"}) == (5, 60, 12)
+    assert providers.rate_settings({"provider": "Custom", "model": "model"}) == (60, 60, 0)
+    monkeypatch.setattr(providers.time, "time", lambda: 1_800_000_000)
+    assert providers._retry_after({"retry-after": "12"}) == 12
+    stamp = providers.email.utils.format_datetime(
+        providers.datetime.fromtimestamp(1_800_000_015, providers.timezone.utc))
+    assert providers._retry_after({"Retry-After": stamp}) == 15
+    assert providers._retry_after({"retry-after": "not a date"}) is None
+
+
+def test_shared_rolling_limiter_coordinates_concurrent_requests(tmp_path, monkeypatch):
+    isolate(tmp_path, monkeypatch)
+    now = [1000.0]
+    monkeypatch.setattr(providers.time, "time", lambda: now[0])
+    waits = []
+
+    async def advance(seconds, cancel_event, event=None, stats=None, label="Waiting"):
+        waits.append(seconds)
+        now[0] += seconds
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(providers, "_wait", advance)
+    config = {"provider": "Custom", "base_url": "https://host/v1", "model": "m",
+              "max_requests_per_window": 2, "request_window_seconds": 10,
+              "min_request_interval_seconds": 0}
+    key = "secret"
+
+    async def run():
+        scopes = await asyncio.gather(*[
+            providers._slot(config, key, None) for _ in range(3)])
+        return scopes
+
+    scopes = asyncio.run(run())
+    assert len(set(scopes)) == 1
+    assert waits == [10]
+    saved = json.loads((tmp_path / "request_pacing.json").read_text())
+    stamps = next(iter(saved["requests"].values()))
+    assert len(stamps) == 1  # The third reservation expired the first window entries.
+    assert stamps[0] == 1010
+
+
+def test_minimum_interval_is_enforced(tmp_path, monkeypatch):
+    isolate(tmp_path, monkeypatch)
+    now = [100.0]
+    monkeypatch.setattr(providers.time, "time", lambda: now[0])
+    scope = "same provider and model"
+    assert providers._reserve(scope, 5, 60, 5) == 0
+    assert providers._reserve(scope, 5, 60, 5) == 5
+    now[0] += 5
+    assert providers._reserve(scope, 5, 60, 5) == 0
+
+
+def test_limiter_scopes_are_independent_and_cancel_waits(tmp_path, monkeypatch):
+    isolate(tmp_path, monkeypatch)
+    a = {"provider": "Custom", "base_url": "https://a.example/v1", "model": "m",
+         "max_requests_per_window": 1, "request_window_seconds": 30}
+    b = {**a, "base_url": "https://b.example/v1"}
+    assert asyncio.run(providers._slot(a, "key", None)) != asyncio.run(
+        providers._slot(b, "key", None))
+    alias = {**a, "provider": "Another display name"}
+    assert providers._scope(a, "key") == providers._scope(alias, "key")
+    assert providers._scope(a, "other-key") != providers._scope(a, "key")
+
+    event = asyncio.Event()
+    event.set()
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(providers._wait(10, event))
+
+
+def test_model_requests_retry_429_but_not_quota_or_auth(tmp_path, monkeypatch):
+    isolate(tmp_path, monkeypatch)
+    now = [1000.0]
+    monkeypatch.setattr(providers.time, "time", lambda: now[0])
+    waits = []
+
+    async def fake_wait(seconds, cancel_event, event=None, stats=None, label="Waiting"):
+        waits.append(seconds)
+        now[0] += seconds
+        if stats is not None:
+            stats["wait_seconds"] += seconds
+
+    monkeypatch.setattr(providers, "_wait", fake_wait)
+
+    class Response:
+        def __init__(self, status, body="{}", headers=None):
+            self.status_code = status
+            self.text = body
+            self.headers = headers or {}
+
+    class Client:
+        def __init__(self, responses): self.responses = list(responses); self.count = 0
+        async def post(self, *args, **kwargs):
+            self.count += 1
+            return self.responses.pop(0)
+
+    config = {"provider": "Custom", "base_url": "https://host/v1", "model": "m",
+              "max_requests_per_window": 10, "request_window_seconds": 60,
+              "retry_limit": 2, "max_backoff_seconds": 10}
+    stats = {"attempted": 0, "successful": 0, "rate_limits": 0,
+             "retries": 0, "waits": 0, "wait_seconds": 0.0}
+    client = Client([Response(429, '{"error":{"code":"rate_limit_exceeded"}}',
+                              {"Retry-After": "2"}), Response(200)])
+    response = asyncio.run(providers.model_post(client, config, "key", "https://host/v1/chat",
+        {}, {}, stats=stats))
+    assert response.status_code == 200
+    assert client.count == 2 and waits == [2]
+    assert stats["attempted"] == 2 and stats["rate_limits"] == 1
+    assert stats["retries"] == 1 and stats["successful"] == 1
+
+    waits.clear()
+    quota = Client([Response(429, '{"error":{"code":"insufficient_quota"}}')])
+    failed = asyncio.run(providers.model_post(quota, config, "key", "https://host/v1/chat", {}, {}))
+    assert failed.status_code == 429 and quota.count == 1 and not waits
+
+    auth = Client([Response(401)])
+    failed = asyncio.run(providers.model_post(auth, config, "key", "https://host/v1/chat", {}, {}))
+    assert failed.status_code == 401 and auth.count == 1
+
+
+def test_model_request_retries_connect_error_with_bounded_jitter(tmp_path, monkeypatch):
+    isolate(tmp_path, monkeypatch)
+    delays = []
+    monkeypatch.setattr(providers.random, "uniform", lambda low, high: high)
+
+    async def wait(seconds, *args, **kwargs): delays.append(seconds)
+    monkeypatch.setattr(providers, "_wait", wait)
+
+    class Response:
+        status_code = 200
+        text = ""
+        headers = {}
+
+    class Client:
+        count = 0
+        async def post(self, *args, **kwargs):
+            self.count += 1
+            if self.count == 1:
+                raise providers.httpx.ConnectError("offline")
+            return Response()
+
+    config = {"provider": "Custom", "base_url": "https://host/v1", "model": "m",
+              "max_requests_per_window": 5, "request_window_seconds": 60,
+              "retry_limit": 1, "max_backoff_seconds": 1}
+    client = Client()
+    result = asyncio.run(providers.model_post(client, config, "key", "https://host/v1/chat", {}, {}))
+    assert result.status_code == 200 and client.count == 2
+    assert delays == [1]
+
+
+def test_cancel_during_retry_wait_does_not_send_again(tmp_path, monkeypatch):
+    isolate(tmp_path, monkeypatch)
+    event = asyncio.Event()
+
+    async def cancel_wait(seconds, cancel_event, *args, **kwargs):
+        cancel_event.set()
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(providers, "_wait", cancel_wait)
+
+    class Response:
+        status_code = 429
+        text = '{"error":{"code":"rate_limit_exceeded"}}'
+        headers = {"Retry-After": "1"}
+
+    class Client:
+        count = 0
+        async def post(self, *args, **kwargs):
+            self.count += 1
+            return Response()
+
+    config = {"provider": "Custom", "base_url": "https://host/v1", "model": "m",
+              "max_requests_per_window": 5, "request_window_seconds": 60,
+              "retry_limit": 2, "max_backoff_seconds": 10}
+    client = Client()
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(providers.model_post(client, config, "key", "https://host/v1/chat",
+                                         {}, {}, event))
+    assert client.count == 1
+
+
+def test_rate_limit_longer_than_backoff_is_not_retried(tmp_path, monkeypatch):
+    isolate(tmp_path, monkeypatch)
+    class Response:
+        status_code = 429
+        text = '{"error":{"code":"rate_limit_exceeded"}}'
+        headers = {"Retry-After": "60"}
+    class Client:
+        count = 0
+        async def post(self, *args, **kwargs):
+            self.count += 1
+            return Response()
+    config = {"provider": "Custom", "base_url": "https://host/v1", "model": "m",
+              "max_requests_per_window": 5, "request_window_seconds": 60,
+              "retry_limit": 2, "max_backoff_seconds": 5}
+    client = Client()
+    result = asyncio.run(providers.model_post(client, config, "key", "https://host/v1/chat", {}, {}))
+    assert result.status_code == 429 and client.count == 1
+
+
+def test_stream_retries_only_before_any_content_is_read(tmp_path, monkeypatch):
+    isolate(tmp_path, monkeypatch)
+    now = [1000.0]
+    monkeypatch.setattr(providers.time, "time", lambda: now[0])
+    waits = []
+    async def fake_wait(seconds, *args, **kwargs):
+        waits.append(seconds)
+        now[0] += seconds
+    monkeypatch.setattr(providers, "_wait", fake_wait)
+
+    class Response:
+        headers = {"Retry-After": "1"}
+        def __init__(self, status): self.status_code = status
+        async def aread(self): return b'{"error":{"code":"rate_limit_exceeded"}}'
+
+    class Stream:
+        def __init__(self, status): self.response = Response(status)
+        async def __aenter__(self): return self.response
+        async def __aexit__(self, *args): pass
+
+    class Client:
+        calls = 0
+        def stream(self, *args, **kwargs):
+            self.calls += 1
+            return Stream(429 if self.calls == 1 else 200)
+
+    config = {"provider": "Custom", "base_url": "https://host/v1", "model": "m",
+              "max_requests_per_window": 5, "request_window_seconds": 60,
+              "retry_limit": 1, "max_backoff_seconds": 5}
+    client = Client()
+
+    async def run():
+        async with providers.model_stream(client, config, "key", "https://host/v1/chat", {}, {}):
+            return True
+    assert asyncio.run(run()) is True
+    assert client.calls == 2 and waits == [1]
+
+
+def test_stream_read_failure_is_not_replayed(tmp_path, monkeypatch):
+    isolate(tmp_path, monkeypatch)
+
+    class Response:
+        status_code = 200
+        headers = {}
+
+    class Stream:
+        async def __aenter__(self): return Response()
+        async def __aexit__(self, *args): pass
+
+    class Client:
+        calls = 0
+        def stream(self, *args, **kwargs):
+            self.calls += 1
+            return Stream()
+
+    config = {"provider": "Custom", "base_url": "https://host/v1", "model": "m",
+              "max_requests_per_window": 5, "request_window_seconds": 60,
+              "retry_limit": 3, "max_backoff_seconds": 5}
+    client = Client()
+
+    async def run():
+        async with providers.model_stream(client, config, "key", "https://host/v1/chat", {}, {}):
+            raise providers.httpx.ReadTimeout("stream ended partway through")
+
+    with pytest.raises(providers.httpx.ReadTimeout):
+        asyncio.run(run())
+    assert client.calls == 1
+
+
 def test_responses_adapter_converts_tools_and_tool_results():
     chat_tools = [{"type": "function", "function": {
         "name": "read_file", "description": "Read text", "parameters": {"type": "object"}}}]
@@ -104,6 +374,8 @@ def test_agent_completes_responses_tool_cycle(tmp_path, monkeypatch):
     assert (project / "note.txt").read_text(encoding="utf-8") == "hello"
     assert all(url.endswith("/responses") for url, _ in calls)
     assert calls[1][1]["input"][-1]["type"] == "function_call_output"
+    assert result["request_stats"]["attempted"] == 3
+    assert result["request_stats"]["successful"] == 3
 
 
 def test_streaming_chat_builds_tool_calls_and_emits_text(tmp_path, monkeypatch):
@@ -184,6 +456,7 @@ def test_stream_provider_error_is_categorized_and_sse_disconnect_closes(tmp_path
 
     class ErrorReply:
         status_code = 429
+        headers = {}
         async def __aenter__(self): return self
         async def __aexit__(self, *args): pass
         async def aread(self): return b'{"error":{"code":"rate_limit"}}'

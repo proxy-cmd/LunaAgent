@@ -114,7 +114,8 @@ def _db() -> sqlite3.Connection:
                                     ("mode", "TEXT", "'read_only'"),
                                     ("parent_id", "INTEGER", "NULL"),
                                     ("request_id", "TEXT", "NULL"),
-                                    ("usage", "TEXT", "NULL")):
+                                    ("usage", "TEXT", "NULL"),
+                                    ("request_stats", "TEXT", "NULL")):
         if name not in columns:
             db.execute(f"ALTER TABLE tasks ADD COLUMN {name} {sql_type} DEFAULT {default}")
     db.execute("CREATE TABLE IF NOT EXISTS task_events (id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL, created TEXT DEFAULT CURRENT_TIMESTAMP, kind TEXT NOT NULL, detail TEXT NOT NULL)")
@@ -164,7 +165,7 @@ def _create_task(task: TaskInput, parent_id: int | None = None) -> int:
 
 def _task_state(task_id: int) -> dict:
     db = _db()
-    row = db.execute("SELECT id,created,message,answer,model,workspace,status,error,request_id,usage FROM tasks WHERE id=?",
+    row = db.execute("SELECT id,created,message,answer,model,workspace,status,error,request_id,usage,request_stats FROM tasks WHERE id=?",
                      (task_id,)).fetchone()
     if not row:
         db.close()
@@ -178,6 +179,7 @@ def _task_state(task_id: int) -> dict:
     return {"id": row[0], "created": row[1], "message": row[2], "answer": row[3],
             "model": row[4], "workspace": row[5], "status": row[6], "error": row[7],
             "request_id": row[8], "usage": json.loads(row[9]) if row[9] else None,
+            "request_stats": json.loads(row[10]) if row[10] else None,
             "can_resume": row[6] == "interrupted" and not effects,
             "approval": {"command": _redact_text(approval["command"])} if approval else None,
             "events": [{"id": e[0], "created": e[1], "kind": e[2], "detail": e[3]} for e in events]}
@@ -185,7 +187,9 @@ def _task_state(task_id: int) -> dict:
 
 async def _run_job(task_id: int, task: TaskInput, cancel_event: asyncio.Event) -> None:
     try:
-        await _agent(task, task_id, cancel_event)
+        provider, _ = providers.get_default()
+        async with asyncio.timeout(provider.get("task_timeout_seconds", 900)):
+            await _agent(task, task_id, cancel_event)
     except asyncio.CancelledError:
         _set_task(task_id, "cancelled", "Task was cancelled by the user.")
         _task_event(task_id, "status", "Task cancelled")
@@ -193,6 +197,10 @@ async def _run_job(task_id: int, task: TaskInput, cancel_event: asyncio.Event) -
         detail = str(exc.detail)
         _set_task(task_id, "failed", detail[:500])
         _task_event(task_id, "error", detail[:250])
+    except TimeoutError:
+        detail = "Task exceeded the configured overall deadline."
+        _set_task(task_id, "failed", detail)
+        _task_event(task_id, "error", detail)
     except Exception:
         _set_task(task_id, "failed", "Unexpected task error. Check local diagnostics.")
         _task_event(task_id, "error", "Unexpected task error")
@@ -722,23 +730,6 @@ async def _request_approval(task_id: int, command: str,
     return bool(decision.result())
 
 
-async def _model_request(client: httpx.AsyncClient, url: str, headers: dict,
-                         body: dict, cancel_event: asyncio.Event | None):
-    if cancel_event is None:
-        return await client.post(url, headers=headers, json=body)
-    if cancel_event.is_set():
-        raise asyncio.CancelledError
-    request = asyncio.create_task(client.post(url, headers=headers, json=body))
-    cancelled = asyncio.create_task(cancel_event.wait())
-    done, _ = await asyncio.wait({request, cancelled}, return_when=asyncio.FIRST_COMPLETED)
-    if cancelled in done and cancel_event.is_set():
-        request.cancel()
-        await asyncio.gather(request, return_exceptions=True)
-        raise asyncio.CancelledError
-    cancelled.cancel()
-    return request.result()
-
-
 def _stream_delta(task_id: int | None, detail: str) -> None:
     if task_id and detail:
         _task_event(task_id, "assistant_delta", detail)
@@ -747,7 +738,8 @@ def _stream_delta(task_id: int | None, detail: str) -> None:
 async def _stream_response(client: httpx.AsyncClient, url: str, headers: dict,
                            body: dict, protocol: str, key: str,
                            cancel_event: asyncio.Event | None,
-                           task_id: int | None) -> dict:
+                           task_id: int | None, provider_config: dict | None = None,
+                           stats: dict | None = None) -> dict:
     """Read provider SSE events and return the same shape as a normal response."""
     body["stream"] = True
     content = ""
@@ -756,7 +748,12 @@ async def _stream_response(client: httpx.AsyncClient, url: str, headers: dict,
     response_data = None
     model = None
     carry = max(128, len(key) + 16)
-    async with client.stream("POST", url, headers=headers, json=body) as response:
+    config = provider_config or {"provider": "Custom", "base_url": url,
+        "model": "test-model", "max_requests_per_window": 60,
+        "request_window_seconds": 60, "retry_limit": 0, "max_backoff_seconds": 30}
+    event = (lambda detail: _task_event(task_id, "status", detail)) if task_id else None
+    async with providers.model_stream(client, config, key, url, headers, body,
+                                      cancel_event, event, stats) as response:
         if response.status_code >= 400:
             body_text = await response.aread()
             category, message = providers._error(response.status_code, body_text.decode(errors="replace"))
@@ -843,7 +840,7 @@ async def _stream_response(client: httpx.AsyncClient, url: str, headers: dict,
 async def _agent_request(client: httpx.AsyncClient, provider: dict, key: str,
                          messages: list[dict], tools: list[dict],
                          cancel_event: asyncio.Event | None,
-                         task_id: int | None) -> dict:
+                         task_id: int | None, stats: dict | None = None) -> dict:
     protocol = provider["protocol"]
     if protocol == "responses":
         url = provider["base_url"].rstrip("/") + "/responses"
@@ -857,18 +854,23 @@ async def _agent_request(client: httpx.AsyncClient, provider: dict, key: str,
     else:
         raise HTTPException(422, "This provider protocol is not supported by the agent.")
     headers = {"Authorization": "Bearer " + key}
-    if provider.get("streaming"):
-        data = await _stream_response(client, url, headers, body, protocol, key,
-                                      cancel_event, task_id)
-    else:
-        response = await _model_request(client, url, headers, body, cancel_event)
-        if response.status_code >= 400:
-            category, message = providers._error(response.status_code, response.text)
-            raise HTTPException(502, category + ": " + message)
-        try:
-            data = response.json()
-        except ValueError as exc:
-            raise HTTPException(502, "The provider returned invalid JSON.") from exc
+    event = (lambda detail: _task_event(task_id, "status", detail)) if task_id else None
+    try:
+        if provider.get("streaming"):
+            data = await _stream_response(client, url, headers, body, protocol, key,
+                                          cancel_event, task_id, provider, stats)
+        else:
+            response = await providers.model_post(client, provider, key, url, headers,
+                                                  body, cancel_event, event, stats)
+            if response.status_code >= 400:
+                category, message = providers._error(response.status_code, response.text)
+                raise HTTPException(502, category + ": " + message)
+            try:
+                data = response.json()
+            except ValueError as exc:
+                raise HTTPException(502, "The provider returned invalid JSON.") from exc
+    except providers.ProviderRequestError as exc:
+        raise HTTPException(502, str(exc)) from exc
     try:
         result = parser(data)
     except PermissionError as exc:
@@ -913,6 +915,8 @@ async def _agent(task: TaskInput, task_id: int | None = None,
              + desktop_tools.tool_specs())
     started = time.monotonic()
     calls = 0
+    stats = {"attempted": 0, "successful": 0, "rate_limits": 0,
+             "retries": 0, "waits": 0, "wait_seconds": 0.0}
     if task_id:
         _task_event(task_id, "status", "Agent started for " + str(root))
     try:
@@ -924,7 +928,7 @@ async def _agent(task: TaskInput, task_id: int | None = None,
                 if context_size > 400_000:
                     raise HTTPException(413, "Task context reached the configured size limit.")
                 result = await _agent_request(client, provider, key, messages, tools,
-                                              cancel_event, task_id)
+                                              cancel_event, task_id, stats)
                 message = result["message"]
                 messages.append(message)
                 tool_calls = message.get("tool_calls", [])
@@ -932,9 +936,10 @@ async def _agent(task: TaskInput, task_id: int | None = None,
                     answer = _redact_text(message.get("content") or "The model returned no text.")
                     db = _db()
                     if task_id:
-                        db.execute("UPDATE tasks SET answer=?, model=?, status='completed', error=NULL,request_id=?,usage=? WHERE id=?",
+                        db.execute("UPDATE tasks SET answer=?, model=?, status='completed', error=NULL,request_id=?,usage=?,request_stats=? WHERE id=?",
                                    (answer, result["model"], result.get("id"),
                                     json.dumps(result.get("usage")) if result.get("usage") is not None else None,
+                                    json.dumps(stats),
                                     task_id))
                     else:
                         db.execute("INSERT INTO tasks(message,answer,model,workspace,request_id,usage) VALUES(?,?,?,?,?,?)",
@@ -945,7 +950,8 @@ async def _agent(task: TaskInput, task_id: int | None = None,
                     if task_id:
                         _task_event(task_id, "status", "Task completed")
                     return {"answer": answer, "model": result["model"],
-                            "iterations": calls, "elapsed_seconds": round(time.monotonic()-started, 2)}
+                            "iterations": calls, "elapsed_seconds": round(time.monotonic()-started, 2),
+                            "request_stats": stats}
                 for call in tool_calls:
                     if cancel_event and cancel_event.is_set():
                         raise asyncio.CancelledError
@@ -970,6 +976,16 @@ async def _agent(task: TaskInput, task_id: int | None = None,
         raise HTTPException(504, "Model request timed out.") from exc
     except httpx.RequestError as exc:
         raise HTTPException(502, "Could not reach the configured model provider.") from exc
+    finally:
+        if task_id:
+            db = _db()
+            db.execute("UPDATE tasks SET request_stats=? WHERE id=?", (json.dumps(stats), task_id))
+            db.commit()
+            db.close()
+            _task_event(task_id, "status",
+                f"Model requests: {stats['attempted']} attempted, {stats['successful']} successful; "
+                f"{stats['rate_limits']} rate limits, {stats['retries']} retries, "
+                f"{stats['wait_seconds']} seconds waiting.")
 
 
 @app.get("/")

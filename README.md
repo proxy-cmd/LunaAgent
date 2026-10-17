@@ -27,6 +27,16 @@ The Settings page supports multiple OpenAI-compatible providers, Chat Completion
 
 Provider metadata lives in `.luna/providers.json`; API keys live in the ignored root `.env`. The settings API returns only whether a key exists. Use **Change key** or **Remove key** in the provider card. The `.env` file is local plaintext protected by the current Windows account’s file permissions. Do not share it. Rotate a key if it has been exposed.
 
+## Request pacing and retries
+
+Each provider has editable limits for requests per rolling window, the minimum interval between requests, retry count, maximum backoff, request timeout, and overall task deadline. The default for an Apinex `free/*` model is 5 HTTP requests in 60 seconds, paced at least 12 seconds apart, with 2 retries and a 30-second maximum backoff. Other new providers default to 60 requests per 60 seconds with no minimum interval. These are local settings, not claims about provider policy.
+
+APInex's public [Chat Completions documentation](https://apinex.bond/developers/models/chat) describes its endpoint and tool support, but does not define what a “round” means or publish a per-model request cap there. Luna therefore treats the reported 5-round rate as an unverified assumption. A local tool execution is not a model request; the next model call is. The rolling limiter state is saved in `.luna/request_pacing.json` and coordinates tasks in this Luna process across restarts. It does not coordinate separate Luna processes.
+
+On HTTP 429, Luna distinguishes rate limiting from quota and billing errors. It honors a valid `Retry-After` value in seconds or HTTP-date form; otherwise it uses capped exponential backoff with jitter. If a provider's indicated delay exceeds the configured maximum, Luna does not retry early. It retries a small bounded number of connect failures and server errors. It does not retry authentication, quota, or validation failures, and does not restart a stream after partial content. Task history records request attempts, successful responses, rate limits, retries, and wait time when available.
+
+Request limits count HTTP calls; they do not track daily token allowance. Luna does not reset or enforce a provider's daily token balance. Check the provider dashboard for current allowance and usage.
+
 ## Projects and agent tasks
 
 Open **Workspace**, enter an existing folder path, and choose **Open Project**. Browsers cannot browse arbitrary host folders, so Luna uses a path field. Project inspection reports common manifests, languages, likely entry points, scripts, Git status, and whether `AGENTS.md` exists; it does not run project code.

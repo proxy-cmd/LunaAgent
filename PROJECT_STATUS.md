@@ -6,6 +6,12 @@
   connection testing, provider editing, default selection, and key removal.
 - Local provider configuration in an ignored `.env` file and non-secret
   provider metadata under `.luna`.
+- A provider-scoped rolling request limiter shared by connection tests, agent
+  calls, follow-up calls, and streaming requests. Limit state persists in
+  `.luna/request_pacing.json` and includes only hashed quota scopes.
+- Bounded retries for rate limits, connection failures, and server errors;
+  cancellation-aware waits; overall task deadlines; request statistics in
+  task history; and editable per-provider pacing settings.
 - Chat Completions and Responses request support, tool-call normalization,
   streaming events, task cancellation, safe task resume, and persisted history.
 - Project selection and inspection; bounded file search and reads; guarded
@@ -28,6 +34,17 @@
   transports, and long-lived subscriptions are not implemented.
 - Provider streaming and Responses tool cycles are covered by mocked tests;
   they were not verified live with Apinex during this pass.
+- APInex's public Chat Completions documentation does not define “round” or
+  publish a model-specific request cap. Five requests per 60 seconds with a
+  12-second minimum spacing is a configurable conservative default for
+  Apinex `free/*`, not a verified provider limit.
+- The reviewed [APInex Chat Completions docs](https://apinex.bond/developers/models/chat)
+  document the endpoint and feature support, but publish no rate-window or
+  “round” definition for the free Luna model.
+- The limiter coordinates tasks in one Luna process and persists across
+  restarts. Separate Luna processes do not share an atomic request queue.
+- Daily token allowance is separate from HTTP request pacing and is not
+  enforced locally; check provider dashboard usage.
 - Restoring moves of directories recreates file entries, but empty nested
   directories are not represented in the file change records.
 - A live agent tool cycle ran, but its exact-output assertion failed because
@@ -42,20 +59,19 @@ It was exposed in chat during setup; rotate it after verification.
 
 ## Verification
 
-- `python -m pytest -q`: **42 passed, 1 skipped**. The skip is the real-browser
-  fixture because the global Python environment has no Playwright runtime.
-- `.venv\Scripts\python.exe -m pytest -q`: **43 passed**. Starlette emitted
+- `.venv\Scripts\python.exe -m pytest -q`: **54 passed**. Starlette emitted
   one AnyIO `BlockingPortal` deprecation warning.
-- Frontend JavaScript passed `node --check`.
-- `git diff --check` passed; Git reported only its LF-to-CRLF normalization
-  notice for changed files.
-- `run.ps1 -NoBrowser` started successfully. The page, setup status, providers,
-  skills, MCP, browser status, desktop status, projects, and history endpoints
-  all returned HTTP 200.
+- `python -m pytest -q`: **53 passed, 1 skipped**. The skip is the real-browser
+  fixture because the global Python environment has no Playwright runtime.
+- Frontend JavaScript passed `node --check`; `git diff --check` passed.
+- `run.ps1 -NoBrowser` started successfully. The page, setup status, and
+  providers endpoints returned HTTP 200. Provider responses include the new
+  pacing settings and do not return API keys.
 - The real Playwright browser fixture passed in the virtual environment.
 - A harmless real UI Automation click passed. Desktop typing was mock-tested.
 - The live Apinex connection test passed. The live agent interaction reached
   tool execution but failed the exact-text assertion; a retry hit a provider
   rate limit. Responses and streaming behavior remain mock-verified.
+- No live request was made to test the new limiter or retry behavior.
 
 No commit or push is part of this task.
