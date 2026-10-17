@@ -13,9 +13,10 @@ from PySide6.QtCore import QDir, QLockFile, QSettings, QSortFilterProxyModel, QT
 from PySide6.QtGui import QAction, QFont
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFileSystemModel,
-    QFormLayout, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox,
+    QCheckBox, QDoubleSpinBox, QFormLayout, QHBoxLayout, QLabel, QLineEdit,
+    QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
     QPlainTextEdit, QPushButton, QSplitter, QStatusBar,
-    QTreeView, QVBoxLayout, QWidget, QDockWidget, QInputDialog,
+    QSpinBox, QTreeView, QVBoxLayout, QWidget, QDockWidget, QInputDialog, QTabWidget,
 )
 
 BASE_URL = "http://127.0.0.1:8765"
@@ -66,7 +67,8 @@ class Backend:
 
 def request(method: str, path: str, **kwargs):
     try:
-        response = httpx.request(method, BASE_URL + path, timeout=10, **kwargs)
+        timeout = kwargs.pop("timeout", 10)
+        response = httpx.request(method, BASE_URL + path, timeout=timeout, **kwargs)
     except httpx.HTTPError as exc:
         raise RuntimeError(f"Could not reach Luna Desk: {exc}") from exc
     try:
@@ -145,6 +147,26 @@ class TaskComposer(QPlainTextEdit):
         super().keyPressEvent(event)
 
 
+class ApiWorker(QThread):
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, method: str, path: str, payload: dict | None = None,
+                 timeout: float = 10, parent=None):
+        super().__init__(parent)
+        self.method = method
+        self.path = path
+        self.payload = payload
+        self.timeout = timeout
+
+    def run(self):
+        try:
+            kwargs = {"json": self.payload} if self.payload is not None else {}
+            self.completed.emit(request(self.method, self.path, timeout=self.timeout, **kwargs))
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
 class LunaWindow(QMainWindow):
     def __init__(self, backend: Backend):
         super().__init__()
@@ -185,6 +207,9 @@ class LunaWindow(QMainWindow):
         settings_action = QAction("Providers", self)
         settings_action.triggered.connect(self.show_provider_settings)
         bar.addAction(settings_action)
+        integrations_action = QAction("Skills / MCP / Automation", self)
+        integrations_action.triggered.connect(self.show_integrations_settings)
+        bar.addAction(integrations_action)
         new_action = QAction("New Task", self)
         new_action.setShortcut("Ctrl+N")
         new_action.triggered.connect(lambda: self.composer.setFocus())
@@ -334,6 +359,9 @@ class LunaWindow(QMainWindow):
         dialog = ProviderDialog(self)
         if dialog.exec() == QDialog.Accepted:
             self.refresh_provider()
+
+    def show_integrations_settings(self):
+        IntegrationsDialog(self).exec()
 
     def show_history(self):
         try:
@@ -506,8 +534,264 @@ class LunaWindow(QMainWindow):
             self.stop_task()
             self.worker.requestInterruption()
             self.worker.wait(2500)
+        elif self.composer.toPlainText().strip():
+            choice = QMessageBox.question(self, "Unsent task", "Close Luna Desk and discard the unsent task text?", QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if choice != QMessageBox.Yes:
+                event.ignore()
+                return
         self.settings.setValue("window/geometry", self.saveGeometry())
         self.backend.stop()
+        event.accept()
+
+
+class IntegrationsDialog(QDialog):
+    """Native management view for shared skills, MCP and automation settings."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Skills, MCP and automation")
+        self.resize(800, 650)
+        self.worker = None
+        self.skills = {}
+        self.servers = {}
+        outer = QVBoxLayout(self)
+        tabs = QTabWidget()
+        outer.addWidget(tabs, 1)
+        self.status = QLabel("")
+        self.status.setWordWrap(True)
+        outer.addWidget(self.status)
+
+        skills_tab = QWidget()
+        skills_layout = QVBoxLayout(skills_tab)
+        self.skill_list = QListWidget()
+        self.skill_details = QPlainTextEdit()
+        self.skill_details.setReadOnly(True)
+        skills_layout.addWidget(self.skill_list, 1)
+        skills_layout.addWidget(self.skill_details, 1)
+        skill_buttons = QHBoxLayout()
+        for label, callback in (("Install from folder…", self.install_skill), ("Inspect", self.inspect_skill), ("Enable / disable", self.toggle_skill), ("Remove", self.remove_skill), ("Refresh", self.refresh_skills)):
+            button = QPushButton(label)
+            button.clicked.connect(callback)
+            skill_buttons.addWidget(button)
+        skills_layout.addLayout(skill_buttons)
+        tabs.addTab(skills_tab, "Skills")
+
+        mcp_tab = QWidget()
+        mcp_layout = QVBoxLayout(mcp_tab)
+        mcp_form = QFormLayout()
+        self.mcp_name = QLineEdit()
+        self.mcp_url = QLineEdit()
+        self.mcp_url.setPlaceholderText("https://host/mcp or configured loopback URL")
+        mcp_form.addRow("Server name", self.mcp_name)
+        mcp_form.addRow("Streamable HTTP URL", self.mcp_url)
+        mcp_layout.addLayout(mcp_form)
+        self.mcp_list = QListWidget()
+        mcp_layout.addWidget(self.mcp_list, 1)
+        mcp_buttons = QHBoxLayout()
+        for label, callback in (("Add server", self.add_mcp), ("Connect / refresh tools", self.connect_mcp), ("Enable / disable tools", self.toggle_mcp), ("Disconnect", self.disconnect_mcp), ("Remove", self.remove_mcp), ("Refresh", self.refresh_mcp)):
+            button = QPushButton(label)
+            button.clicked.connect(callback)
+            mcp_buttons.addWidget(button)
+        mcp_layout.addLayout(mcp_buttons)
+        tabs.addTab(mcp_tab, "MCP")
+
+        automation = QWidget()
+        automation_layout = QVBoxLayout(automation)
+        automation_layout.addWidget(QLabel("Browser automation"))
+        self.browser_status = QLabel("")
+        automation_layout.addWidget(self.browser_status)
+        browser_buttons = QHBoxLayout()
+        self.browser_toggle = QPushButton("Start browser session")
+        self.browser_toggle.clicked.connect(self.toggle_browser)
+        browser_buttons.addWidget(self.browser_toggle)
+        automation_layout.addLayout(browser_buttons)
+        automation_layout.addWidget(QLabel("Windows UI Automation"))
+        self.desktop_status = QLabel("")
+        automation_layout.addWidget(self.desktop_status)
+        desktop_buttons = QHBoxLayout()
+        self.desktop_toggle = QPushButton("Enable desktop access")
+        self.desktop_toggle.clicked.connect(self.toggle_desktop)
+        desktop_buttons.addWidget(self.desktop_toggle)
+        automation_layout.addLayout(desktop_buttons)
+        automation_layout.addStretch(1)
+        tabs.addTab(automation, "Automation")
+        close = QDialogButtonBox(QDialogButtonBox.Close)
+        close.rejected.connect(self.reject)
+        outer.addWidget(close)
+        self.refresh_skills()
+        self.refresh_mcp()
+        self.refresh_automation()
+
+    def _selected_id(self, listing):
+        item = listing.currentItem()
+        return item.data(Qt.UserRole) if item else None
+
+    def _action(self, method, path, payload, button, callback, timeout=10):
+        if self.worker and self.worker.isRunning():
+            return
+        button.setEnabled(False)
+        self.worker = ApiWorker(method, path, payload, timeout, self)
+        self.worker.completed.connect(lambda result: (button.setEnabled(True), callback(result)))
+        self.worker.failed.connect(lambda error: (button.setEnabled(True), self.status.setText(error)))
+        self.worker.finished.connect(lambda: setattr(self, "worker", None))
+        self.worker.start()
+
+    def refresh_skills(self):
+        try:
+            items = request("GET", "/api/skills").get("skills", [])
+            self.skills = {item["id"]: item for item in items}
+            self.skill_list.clear()
+            for item in items:
+                row = QListWidgetItem(f"{item['name']} · v{item['version']} · {'enabled' if item['enabled'] else 'disabled'}")
+                row.setData(Qt.UserRole, item["id"])
+                self.skill_list.addItem(row)
+            self.status.setText(f"{len(items)} skill(s) configured. Skill instructions are untrusted task context.")
+        except Exception as exc:
+            self.status.setText(str(exc))
+
+    def install_skill(self):
+        source = QFileDialog.getExistingDirectory(self, "Install skill from folder", str(Path.home()))
+        if not source:
+            return
+        try:
+            request("POST", "/api/skills/install", json={"source": source})
+            self.refresh_skills()
+        except Exception as exc:
+            self.status.setText(str(exc))
+
+    def inspect_skill(self):
+        skill_id = self._selected_id(self.skill_list)
+        if not skill_id:
+            return
+        try:
+            info = request("GET", f"/api/skills/{skill_id}")
+            self.skill_details.setPlainText(info.get("instructions", "") + "\n\nFiles: " + ", ".join(info.get("files", [])))
+        except Exception as exc:
+            self.status.setText(str(exc))
+
+    def toggle_skill(self):
+        skill_id = self._selected_id(self.skill_list)
+        if not skill_id:
+            return
+        enabled = not self.skills[skill_id]["enabled"]
+        try:
+            request("PUT", f"/api/skills/{skill_id}/enabled", json={"enabled": enabled})
+            self.refresh_skills()
+        except Exception as exc:
+            self.status.setText(str(exc))
+
+    def remove_skill(self):
+        skill_id = self._selected_id(self.skill_list)
+        if not skill_id:
+            return
+        item = self.skills[skill_id]
+        if QMessageBox.question(self, "Remove skill", f"Remove {item['name']} and its Luna-managed copy?", QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+            return
+        try:
+            request("DELETE", f"/api/skills/{skill_id}")
+            self.refresh_skills()
+        except Exception as exc:
+            self.status.setText(str(exc))
+
+    def refresh_mcp(self):
+        try:
+            items = request("GET", "/api/mcp").get("servers", [])
+            self.servers = {item["id"]: item for item in items}
+            self.mcp_list.clear()
+            for item in items:
+                state = ("connected" if item.get("connected") else "disconnected") + (" · enabled" if item.get("enabled") else " · disabled")
+                tools = ", ".join(tool["name"] for tool in item.get("tools", []))
+                row = QListWidgetItem(f"{item['name']} · {state}\n{item['url']}\n{tools}")
+                row.setData(Qt.UserRole, item["id"])
+                self.mcp_list.addItem(row)
+        except Exception as exc:
+            self.status.setText(str(exc))
+
+    def add_mcp(self):
+        name, url = self.mcp_name.text().strip(), self.mcp_url.text().strip()
+        if not name or not url:
+            self.status.setText("Enter both an MCP server name and URL.")
+            return
+        try:
+            request("POST", "/api/mcp", json={"name": name, "url": url})
+            self.mcp_name.clear()
+            self.mcp_url.clear()
+            self.refresh_mcp()
+        except Exception as exc:
+            self.status.setText(str(exc))
+
+    def connect_mcp(self):
+        server_id = self._selected_id(self.mcp_list)
+        if not server_id:
+            return
+        self._action("POST", f"/api/mcp/{server_id}/connect", {}, self.sender(), lambda _: self.refresh_mcp(), timeout=45)
+
+    def toggle_mcp(self):
+        server_id = self._selected_id(self.mcp_list)
+        if not server_id:
+            return
+        enabled = not self.servers[server_id].get("enabled")
+        if enabled and QMessageBox.question(self, "Enable MCP tools", "Each MCP tool call will pause for approval. Enable tools from this server?", QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+            return
+        try:
+            request("PUT", f"/api/mcp/{server_id}/enabled", json={"enabled": enabled})
+            self.refresh_mcp()
+        except Exception as exc:
+            self.status.setText(str(exc))
+
+    def disconnect_mcp(self):
+        server_id = self._selected_id(self.mcp_list)
+        if server_id:
+            self._action("POST", f"/api/mcp/{server_id}/disconnect", {}, self.sender(), lambda _: self.refresh_mcp())
+
+    def remove_mcp(self):
+        server_id = self._selected_id(self.mcp_list)
+        if not server_id:
+            return
+        if QMessageBox.question(self, "Remove MCP server", "Remove this server configuration?", QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+            return
+        try:
+            request("DELETE", f"/api/mcp/{server_id}")
+            self.refresh_mcp()
+        except Exception as exc:
+            self.status.setText(str(exc))
+
+    def refresh_automation(self):
+        try:
+            state = request("GET", "/api/browser/status")
+            self.browser_status.setText("Playwright installed" if state.get("installed") else "Install requirements-browser.txt and Chromium to use browser automation")
+            self.browser_toggle.setText("Close browser session" if state.get("active") else "Start browser session")
+        except Exception as exc:
+            self.browser_status.setText(str(exc))
+        try:
+            state = request("GET", "/api/desktop/status")
+            self.desktop_status.setText("Available" if state.get("available") else "Install requirements-desktop.txt to use Windows UI Automation")
+            self.desktop_toggle.setText("Disable desktop access" if state.get("enabled") else "Enable desktop access")
+            self.desktop_toggle.setEnabled(bool(state.get("available")))
+        except Exception as exc:
+            self.desktop_status.setText(str(exc))
+
+    def toggle_browser(self):
+        try:
+            state = request("GET", "/api/browser/status")
+            if state.get("active"):
+                self._action("POST", "/api/browser/close", {}, self.sender(), lambda _: self.refresh_automation())
+            else:
+                self._action("POST", "/api/browser/start", {"allow_local": False}, self.sender(), lambda _: self.refresh_automation())
+        except Exception as exc:
+            self.status.setText(str(exc))
+
+    def toggle_desktop(self):
+        try:
+            state = request("GET", "/api/desktop/status")
+            self._action("PUT", "/api/desktop/enabled", {"enabled": not state.get("enabled")}, self.sender(), lambda _: self.refresh_automation())
+        except Exception as exc:
+            self.status.setText(str(exc))
+
+    def closeEvent(self, event):
+        if self.worker and self.worker.isRunning():
+            self.status.setText("Please wait for the current connection operation to finish before closing.")
+            event.ignore()
+            return
         event.accept()
 
 
@@ -516,8 +800,9 @@ class ProviderDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Provider settings")
-        self.resize(620, 540)
+        self.resize(720, 780)
         self.providers = []
+        self.worker = None
         layout = QVBoxLayout(self)
         self.selector = QComboBox()
         self.selector.currentIndexChanged.connect(self.load_selected)
@@ -537,6 +822,28 @@ class ProviderDialog(QDialog):
         self.protocol.addItem("Chat Completions", "chat_completions")
         self.protocol.addItem("Responses", "responses")
         form.addRow("Protocol", self.protocol)
+        self.numeric = {}
+        for key, title, minimum, maximum, value in (
+            ("timeout", "Request timeout (seconds)", 5, 300, 60),
+            ("max_iterations", "Agent iterations", 1, 100, 12),
+            ("max_requests_per_window", "Requests per window", 1, 600, 5),
+            ("request_window_seconds", "Request window (seconds)", 1, 3600, 60),
+            ("retry_limit", "Retry limit", 0, 5, 2),
+            ("max_backoff_seconds", "Maximum backoff (seconds)", 1, 300, 30),
+            ("task_timeout_seconds", "Task deadline (seconds)", 30, 7200, 900),
+        ):
+            spin = QSpinBox()
+            spin.setRange(minimum, maximum)
+            spin.setValue(value)
+            self.numeric[key] = spin
+            form.addRow(title, spin)
+        self.numeric["min_request_interval_seconds"] = QDoubleSpinBox()
+        self.numeric["min_request_interval_seconds"].setRange(0, 3600)
+        self.numeric["min_request_interval_seconds"].setDecimals(2)
+        self.numeric["min_request_interval_seconds"].setValue(12)
+        form.addRow("Minimum request interval (seconds)", self.numeric["min_request_interval_seconds"])
+        self.streaming = QCheckBox("Prefer streaming responses")
+        form.addRow("Streaming", self.streaming)
         layout.addLayout(form)
         self.message = QLabel("")
         self.message.setWordWrap(True)
@@ -544,19 +851,25 @@ class ProviderDialog(QDialog):
         actions = QHBoxLayout()
         add = QPushButton("New Apinex provider")
         add.clicked.connect(self.new_provider)
-        test = QPushButton("Test connection")
-        test.clicked.connect(self.test_provider)
+        self.test_button = QPushButton("Test connection")
+        self.test_button.clicked.connect(self.test_provider)
         save = QPushButton("Save provider")
         save.clicked.connect(self.save_provider)
         default = QPushButton("Make default")
         default.clicked.connect(self.make_default)
         finish = QPushButton("Finish first-run setup")
         finish.clicked.connect(self.finish_setup)
+        remove_key = QPushButton("Remove saved key")
+        remove_key.clicked.connect(self.remove_key)
+        remove_provider = QPushButton("Remove provider")
+        remove_provider.clicked.connect(self.remove_provider)
         actions.addWidget(add)
-        actions.addWidget(test)
+        actions.addWidget(self.test_button)
         actions.addWidget(save)
         actions.addWidget(default)
         actions.addWidget(finish)
+        actions.addWidget(remove_key)
+        actions.addWidget(remove_provider)
         layout.addLayout(actions)
         buttons = QDialogButtonBox(QDialogButtonBox.Close)
         buttons.rejected.connect(self.reject)
@@ -587,6 +900,10 @@ class ProviderDialog(QDialog):
         self.fields["api_key"].clear()
         self.fields["api_key"].setPlaceholderText("Leave blank to keep saved key" if item.get("key_configured") else "Enter API key")
         self.protocol.setCurrentIndex(max(0, self.protocol.findData(item.get("protocol"))))
+        for key, control in self.numeric.items():
+            fallback = 12 if key == "min_request_interval_seconds" else control.value()
+            control.setValue(item.get(key) if item.get(key) is not None else fallback)
+        self.streaming.setChecked(bool(item.get("streaming")))
         self.message.setText("Key configured" if item.get("key_configured") else "No key configured")
 
     def new_provider(self):
@@ -596,26 +913,65 @@ class ProviderDialog(QDialog):
         self.fields["api_key"].clear()
         self.fields["api_key"].setPlaceholderText("Enter API key")
         self.protocol.setCurrentIndex(0)
+        defaults = {"timeout": 60, "max_iterations": 12, "max_requests_per_window": 5,
+                    "request_window_seconds": 60, "min_request_interval_seconds": 12,
+                    "retry_limit": 2, "max_backoff_seconds": 30, "task_timeout_seconds": 900}
+        for key, control in self.numeric.items():
+            control.setValue(defaults[key])
+        self.streaming.setChecked(False)
 
     def payload(self):
         selected = self.selector.currentData()
         item = next((p for p in self.providers if p["id"] == selected), None)
         data = {"id": selected, **{key: self.fields[key].text().strip() for key in ("name", "provider", "base_url", "model")},
                 "protocol": self.protocol.currentData(), "api_key": self.fields["api_key"].text() or None,
-                "timeout": (item or {}).get("timeout", 60), "max_iterations": (item or {}).get("max_iterations", 12),
-                "streaming": (item or {}).get("streaming", False),
-                "max_requests_per_window": (item or {}).get("max_requests_per_window", 5),
-                "request_window_seconds": (item or {}).get("request_window_seconds", 60),
-                "min_request_interval_seconds": (item or {}).get("min_request_interval_seconds", 12),
-                "retry_limit": (item or {}).get("retry_limit", 2),
-                "max_backoff_seconds": (item or {}).get("max_backoff_seconds", 30),
-                "task_timeout_seconds": (item or {}).get("task_timeout_seconds", 900)}
+                "streaming": self.streaming.isChecked()}
+        data.update({key: control.value() for key, control in self.numeric.items()})
         return data
 
     def test_provider(self):
+        self.test_button.setEnabled(False)
+        self.message.setText("Testing provider connection…")
+        self.worker = ApiWorker("POST", "/api/providers/test", self.payload(), 330, self)
+        self.worker.completed.connect(self._test_completed)
+        self.worker.failed.connect(self._test_failed)
+        self.worker.finished.connect(self._clear_worker)
+        self.worker.start()
+
+    def _test_completed(self, result):
+        self.message.setText(("Connection succeeded" if result.get("ok") else "Connection failed") + ": " + result.get("message", "No details"))
+        self.test_button.setEnabled(True)
+
+    def _test_failed(self, message):
+        self.message.setText(message)
+        self.test_button.setEnabled(True)
+
+    def _clear_worker(self):
+        self.worker = None
+
+    def remove_key(self):
+        selected = self.selector.currentData()
+        if not selected:
+            self.message.setText("Save the provider before removing its key.")
+            return
+        if QMessageBox.question(self, "Remove API key", "Remove this provider's saved key from local storage?", QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+            return
         try:
-            result = request("POST", "/api/providers/test", json=self.payload())
-            self.message.setText(("Connection succeeded" if result.get("ok") else "Connection failed") + ": " + result.get("message", "No details"))
+            request("DELETE", f"/api/providers/{selected}/key")
+            self.reload()
+            self.message.setText("Saved key removed.")
+        except Exception as exc:
+            self.message.setText(str(exc))
+
+    def remove_provider(self):
+        selected = self.selector.currentData()
+        if not selected:
+            return
+        if QMessageBox.question(self, "Remove provider", "Remove this provider and its saved key?", QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+            return
+        try:
+            request("DELETE", f"/api/providers/{selected}")
+            self.reload()
         except Exception as exc:
             self.message.setText(str(exc))
 
@@ -653,6 +1009,13 @@ class ProviderDialog(QDialog):
             self.accept()
         except Exception as exc:
             self.message.setText(str(exc))
+
+    def closeEvent(self, event):
+        if self.worker and self.worker.isRunning():
+            self.message.setText("Please wait for the provider connection test to finish before closing.")
+            event.ignore()
+            return
+        event.accept()
 
 
 def main():

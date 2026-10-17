@@ -34,15 +34,16 @@ The toolbar permission selector maps directly to the backend's supported modes:
 Restricted (read-only) and Workspace (edits and approved actions). The backend
 does not implement Trusted Full Access. Provider API keys are entered into a
 masked native field and stored through the existing local provider mechanism.
-Advanced skills, MCP, browser automation, desktop automation, pacing controls,
-and diagnostics remain available in the browser Settings page at
-`http://127.0.0.1:8765`.
+The native integrations view manages skills and MCP servers, and controls
+browser-session and Windows desktop-access state. The browser Settings page at
+`http://127.0.0.1:8765` retains its detailed automation controls, help, and
+diagnostics.
 
 This first desktop release is a functional native client, but not a full IDE
 replacement: command output is shown in a read-only terminal panel, but there is
 no interactive terminal prompt yet. It also lacks recursive file content search,
-changed-file tree markers, task resume, or native editors for skills/MCP and
-automation settings. Sensitive operations use a native approval dialog and
+changed-file tree markers, task resume, and detailed native browser/desktop
+automation controls. Sensitive operations use a native approval dialog and
 the existing backend policy. The desktop file preview is read-only. Windows
 native dialogs and UI Automation should be manually checked on each target
 Windows setup.

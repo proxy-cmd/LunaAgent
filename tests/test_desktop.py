@@ -50,6 +50,8 @@ def test_native_provider_key_entry_is_masked(app, monkeypatch):
     monkeypatch.setattr(native_app, "request", lambda method, path, **kwargs: {"providers": []})
     dialog = native_app.ProviderDialog()
     assert dialog.fields["api_key"].echoMode() == dialog.fields["api_key"].EchoMode.Password
+    dialog.numeric["retry_limit"].setValue(4)
+    assert dialog.payload()["retry_limit"] == 4
     dialog.close()
 
 
@@ -124,3 +126,26 @@ def test_task_submission_names_the_selected_workspace(monkeypatch):
     assert worker.wait(5000)
     post = next(call for call in calls if call[1] == "/api/tasks")
     assert post[2]["json"]["workspace"] == r"D:\Projects\Native"
+
+
+def test_native_integrations_settings_share_existing_apis(app, monkeypatch):
+    paths = []
+
+    def fake_request(method, path, **kwargs):
+        paths.append(path)
+        if path == "/api/skills":
+            return {"skills": []}
+        if path == "/api/mcp":
+            return {"servers": []}
+        if path == "/api/browser/status":
+            return {"installed": False, "active": False}
+        if path == "/api/desktop/status":
+            return {"available": False, "enabled": False}
+        raise AssertionError(path)
+
+    monkeypatch.setattr(native_app, "request", fake_request)
+    dialog = native_app.IntegrationsDialog()
+    assert paths == ["/api/skills", "/api/mcp", "/api/browser/status", "/api/desktop/status"]
+    assert "browser automation" in dialog.browser_status.text()
+    assert not dialog.desktop_toggle.isEnabled()
+    dialog.close()

@@ -33,6 +33,8 @@
 - Browser API errors convert structured validation details to readable text.
 - Native action approval dialogs and a command-output panel display actual,
   redacted output and exit codes emitted by the shared command runner.
+- Native provider pacing/retry settings, masked key replacement/removal,
+  skill management, MCP server management, and automation state controls.
 
 ## Known limits
 
@@ -40,8 +42,8 @@
   browse arbitrary host folders. The desktop app uses a native folder picker.
 - The native app is an early functional client, not full feature parity. It
   does not yet have an interactive terminal, recursive content search,
-  changed-file explorer markers, task resume UI, or desktop settings for skills, MCP, and
-  browser/desktop automation. Use the browser Settings page for those features.
+  changed-file explorer markers, task resume UI, or the detailed browser and
+  desktop automation controls available in the browser Settings page.
 - Trusted Full Access is not supported by the shared backend. The desktop UI
   exposes only the enforced read-only and workspace modes.
 - The file tree is rooted at the selected project and its built-in preview is
@@ -85,7 +87,7 @@ It was exposed in chat during setup; rotate it after verification.
 
 ## Verification
 
-- `.venv\Scripts\python.exe -m pytest -q`: **65 passed** at the desktop
+- `.venv\Scripts\python.exe -m pytest -q`: **66 passed** at the desktop
   integration check. Qt tests used the offscreen platform. One
   Starlette AnyIO deprecation warning remains.
 - Frontend JavaScript passed `node --check`; `git diff --check` passed. Tests
