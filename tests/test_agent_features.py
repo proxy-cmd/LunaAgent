@@ -1,0 +1,649 @@
+import asyncio
+import json
+from contextlib import asynccontextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+import threading
+
+import pytest
+from fastapi.testclient import TestClient
+
+from backend import (agent_protocols, browser_tools, desktop_tools, main,
+                     mcp_client, projects, providers, skills)
+
+
+def isolate(tmp_path, monkeypatch):
+    monkeypatch.setattr(providers, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(providers, "PROVIDERS_FILE", tmp_path / "providers.json")
+    monkeypatch.setattr(providers, "ENV_FILE", tmp_path / ".env")
+    monkeypatch.setattr(main, "DB", tmp_path / "history.sqlite3")
+    monkeypatch.setattr(projects, "SETTINGS_FILE", tmp_path / "settings.json")
+    monkeypatch.setattr(skills, "SKILLS_DIR", tmp_path / "skills")
+    monkeypatch.setattr(mcp_client, "MCP_FILE", tmp_path / "mcp.json")
+    mcp_client.sessions.clear()
+
+
+def provider(protocol="chat_completions", streaming=False):
+    return providers.ProviderInput(
+        name="Test provider", provider="Custom",
+        base_url="https://provider.example/v1", model="test-model",
+        protocol=protocol, api_key="test-key", streaming=streaming,
+    )
+
+
+def test_responses_adapter_converts_tools_and_tool_results():
+    chat_tools = [{"type": "function", "function": {
+        "name": "read_file", "description": "Read text", "parameters": {"type": "object"}}}]
+    messages = [
+        {"role": "system", "content": "Stay safe."},
+        {"role": "assistant", "content": None, "tool_calls": [{
+            "id": "call-1", "function": {"name": "read_file", "arguments": "{\"path\":\"a.txt\"}"}}]},
+        {"role": "tool", "tool_call_id": "call-1", "content": "file text"},
+    ]
+    body = agent_protocols.response_body("test-model", messages, chat_tools)
+    assert body["input"][-2]["type"] == "function_call"
+    assert body["input"][-1] == {
+        "type": "function_call_output", "call_id": "call-1", "output": "file text"}
+    assert body["tools"][0]["name"] == "read_file"
+
+
+def test_responses_parser_handles_calls_text_refusal_and_incomplete():
+    result = agent_protocols.responses_result({
+        "id": "resp-1", "model": "served-model", "status": "completed",
+        "output_text": "Done", "usage": {"total_tokens": 7},
+        "output": [{"type": "function_call", "call_id": "call-2",
+                    "name": "list_files", "arguments": "{\"path\":\".\"}"}],
+    })
+    assert result["message"]["content"] == "Done"
+    assert result["message"]["tool_calls"][0]["id"] == "call-2"
+    assert result["usage"]["total_tokens"] == 7
+    with pytest.raises(ValueError, match="incomplete"):
+        agent_protocols.responses_result({"status": "incomplete", "output": []})
+    with pytest.raises(PermissionError, match="declined"):
+        agent_protocols.responses_result({"status": "completed", "output": [
+            {"type": "refusal", "refusal": "No"}]})
+
+
+def test_agent_completes_responses_tool_cycle(tmp_path, monkeypatch):
+    isolate(tmp_path, monkeypatch)
+    project = tmp_path / "project"
+    project.mkdir()
+    projects.open_project(str(project))
+    providers.save_provider(provider(protocol="responses"))
+    calls = []
+    results = [
+        {"id": "resp-1", "model": "test-model", "status": "completed", "output": [
+            {"type": "function_call", "call_id": "c1", "name": "write_file",
+             "arguments": json.dumps({"path": "note.txt", "content": "hello", "expected_sha256": None})}]},
+        {"id": "resp-2", "model": "test-model", "status": "completed", "output": [
+            {"type": "function_call", "call_id": "c2", "name": "read_file",
+             "arguments": json.dumps({"path": "note.txt"})}]},
+        {"id": "resp-3", "model": "test-model", "status": "completed",
+         "output_text": "Created and checked note.txt.", "output": [
+             {"type": "message", "content": [{"type": "output_text", "text": "Created and checked note.txt."}]}]},
+    ]
+
+    class Reply:
+        status_code = 200
+        def __init__(self, data): self.data = data
+        def json(self): return self.data
+
+    class Client:
+        def __init__(self, **kwargs): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): pass
+        async def post(self, url, **kwargs):
+            calls.append((url, kwargs["json"]))
+            return Reply(results.pop(0))
+
+    monkeypatch.setattr(main.httpx, "AsyncClient", Client)
+    task = main.TaskInput(message="Write and verify note.txt", mode="workspace")
+    result = asyncio.run(main._agent(task))
+    assert result["answer"] == "Created and checked note.txt."
+    assert result["iterations"] == 2
+    assert (project / "note.txt").read_text(encoding="utf-8") == "hello"
+    assert all(url.endswith("/responses") for url, _ in calls)
+    assert calls[1][1]["input"][-1]["type"] == "function_call_output"
+
+
+def test_streaming_chat_builds_tool_calls_and_emits_text(tmp_path, monkeypatch):
+    isolate(tmp_path, monkeypatch)
+    project = tmp_path / "project"
+    project.mkdir()
+    projects.open_project(str(project))
+    task_id = main._create_task(main.TaskInput(message="write a note"))
+
+    class StreamReply:
+        status_code = 200
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): pass
+        async def aiter_lines(self):
+            values = [
+                {"model": "stream-model", "choices": [{"delta": {"content": "Hello"}}]},
+                {"model": "stream-model", "choices": [{"delta": {"content": " there"}}]},
+                {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "c1",
+                    "function": {"name": "read_file", "arguments": "{\"path\":\"a.txt\"}"}}]}}]},
+                "[DONE]",
+            ]
+            for value in values:
+                await asyncio.sleep(0)
+                yield "data: " + (value if isinstance(value, str) else json.dumps(value))
+
+    def fake_stream(self, *args, **kwargs):
+        return StreamReply()
+
+    monkeypatch.setattr(main.httpx.AsyncClient, "stream", fake_stream)
+    async def run():
+        async with main.httpx.AsyncClient() as client:
+            return await main._stream_response(client, "https://provider.example/v1/chat/completions",
+                {}, {}, "chat_completions", "test-key", asyncio.Event(), task_id)
+    data = asyncio.run(run())
+    result = agent_protocols.chat_result(data)
+    assert result["message"]["content"] == "Hello there"
+    assert result["message"]["tool_calls"][0]["function"]["name"] == "read_file"
+    details = [event["detail"] for event in main._task_state(task_id)["events"]]
+    assert "Hello there" in "".join(details)
+
+
+def test_streaming_responses_parses_text_and_function_calls(tmp_path, monkeypatch):
+    isolate(tmp_path, monkeypatch)
+
+    class StreamReply:
+        status_code = 200
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): pass
+        async def aiter_lines(self):
+            events = [
+                {"type": "response.output_text.delta", "delta": "Done"},
+                {"type": "response.output_item.done", "item": {
+                    "type": "function_call", "call_id": "call-1", "name": "read_file",
+                    "arguments": "{\"path\":\"a.txt\"}"}},
+                {"type": "response.completed", "response": {
+                    "id": "resp-1", "model": "served-model", "status": "completed",
+                    "output_text": "Done", "output": [{"type": "function_call",
+                        "call_id": "call-1", "name": "read_file",
+                        "arguments": "{\"path\":\"a.txt\"}"}]}},
+            ]
+            for item in events:
+                yield "data: " + json.dumps(item)
+
+    monkeypatch.setattr(main.httpx.AsyncClient, "stream",
+                        lambda *args, **kwargs: StreamReply())
+    async def run():
+        async with main.httpx.AsyncClient() as client:
+            data = await main._stream_response(client, "https://provider.example/v1/responses",
+                {}, {}, "responses", "test-key", None, None)
+        return agent_protocols.responses_result(data)
+    result = asyncio.run(run())
+    assert result["message"]["content"] == "Done"
+    assert result["message"]["tool_calls"][0]["id"] == "call-1"
+
+
+def test_stream_provider_error_is_categorized_and_sse_disconnect_closes(tmp_path, monkeypatch):
+    isolate(tmp_path, monkeypatch)
+
+    class ErrorReply:
+        status_code = 429
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): pass
+        async def aread(self): return b'{"error":{"code":"rate_limit"}}'
+
+    monkeypatch.setattr(main.httpx.AsyncClient, "stream",
+                        lambda *args, **kwargs: ErrorReply())
+    async def failing_request():
+        async with main.httpx.AsyncClient() as client:
+            await main._stream_response(client, "https://provider.example/v1/chat/completions",
+                {}, {}, "chat_completions", "test-key", None, None)
+    with pytest.raises(Exception, match="rate_limit"):
+        asyncio.run(failing_request())
+
+    project = tmp_path / "project"
+    project.mkdir()
+    projects.open_project(str(project))
+    task_id = main._create_task(main.TaskInput(message="disconnect"))
+
+    class Disconnected:
+        headers = {}
+        async def is_disconnected(self): return True
+
+    response = asyncio.run(main.stream_task_events(task_id, Disconnected()))
+    async def read_once():
+        with pytest.raises(StopAsyncIteration):
+            await response.body_iterator.__anext__()
+    asyncio.run(read_once())
+
+
+def test_streaming_response_can_be_cancelled(tmp_path, monkeypatch):
+    isolate(tmp_path, monkeypatch)
+
+    class SlowReply:
+        status_code = 200
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): pass
+        async def aiter_lines(self):
+            await asyncio.sleep(10)
+            yield "data: [DONE]"
+
+    monkeypatch.setattr(main.httpx.AsyncClient, "stream", lambda *args, **kwargs: SlowReply())
+    cancel = asyncio.Event()
+
+    async def run():
+        async with main.httpx.AsyncClient() as client:
+            job = asyncio.create_task(main._stream_response(client, "https://example.test",
+                {}, {}, "chat_completions", "test-key", cancel, None))
+            await asyncio.sleep(0.02)
+            cancel.set()
+            with pytest.raises(asyncio.CancelledError):
+                await job
+    asyncio.run(run())
+
+
+def test_task_event_stream_replays_once_and_finishes(tmp_path, monkeypatch):
+    isolate(tmp_path, monkeypatch)
+    project = tmp_path / "project"
+    project.mkdir()
+    projects.open_project(str(project))
+    task_id = main._create_task(main.TaskInput(message="show events"))
+    main._task_event(task_id, "assistant_delta", "hello")
+    main._set_task(task_id, "completed")
+    response = TestClient(main.app).get(f"/api/tasks/{task_id}/events")
+    assert response.status_code == 200
+    assert response.text.count('"detail": "hello"') == 1
+    assert "id: 1" in response.text
+
+
+def test_file_move_and_recursive_delete_require_approval_and_restore(tmp_path, monkeypatch):
+    isolate(tmp_path, monkeypatch)
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "old").mkdir()
+    (project / "old" / "one.txt").write_text("one", encoding="utf-8")
+    projects.open_project(str(project))
+    task_id = main._create_task(main.TaskInput(message="change files", mode="workspace"))
+
+    async def approve(*args, **kwargs): return True
+    monkeypatch.setattr(main, "_request_approval", approve)
+    moved = asyncio.run(main._run_tool("move_path", {"source": "old", "destination": "new"},
+        project, "workspace", task_id=task_id))
+    assert "verified 1 files" in moved
+    assert (project / "new" / "one.txt").read_text(encoding="utf-8") == "one"
+    client = TestClient(main.app)
+    changes = client.get(f"/api/tasks/{task_id}/changes").json()["changes"]
+    assert changes[0]["operation"] == "move"
+    assert client.post(f"/api/changes/{changes[0]['id']}/restore").status_code == 200
+    assert (project / "old" / "one.txt").read_text(encoding="utf-8") == "one"
+
+    removed = asyncio.run(main._run_tool("delete_path", {"path": "old"},
+        project, "workspace", task_id=task_id))
+    assert "recorded 1 files" in removed
+    assert not (project / "old").exists()
+    deletion = client.get(f"/api/tasks/{task_id}/changes").json()["changes"][-1]
+    assert deletion["operation"] == "delete"
+    assert client.post(f"/api/changes/{deletion['id']}/restore").status_code == 200
+    assert (project / "old" / "one.txt").read_text(encoding="utf-8") == "one"
+
+    (project / "empty").mkdir()
+    moved_empty = asyncio.run(main._run_tool("move_path", {
+        "source": "empty", "destination": "empty-moved"}, project, "workspace", task_id=task_id))
+    assert "verified 1 files" in moved_empty
+    empty_move = client.get(f"/api/tasks/{task_id}/changes").json()["changes"][-1]
+    assert empty_move["entry_type"] == "directory"
+    assert client.post(f"/api/changes/{empty_move['id']}/restore").status_code == 200
+    assert (project / "empty").is_dir()
+    removed_empty = asyncio.run(main._run_tool("delete_path", {"path": "empty"},
+        project, "workspace", task_id=task_id))
+    assert "recorded 1 files" in removed_empty
+    empty_delete = client.get(f"/api/tasks/{task_id}/changes").json()["changes"][-1]
+    assert client.post(f"/api/changes/{empty_delete['id']}/restore").status_code == 200
+    assert (project / "empty").is_dir()
+
+
+def test_file_operations_reject_conflicts_paths_and_unapproved_actions(tmp_path, monkeypatch):
+    isolate(tmp_path, monkeypatch)
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "exists.txt").write_text("data", encoding="utf-8")
+    projects.open_project(str(project))
+    task_id = main._create_task(main.TaskInput(message="move safely", mode="workspace"))
+    async def deny(*args, **kwargs): return False
+    monkeypatch.setattr(main, "_request_approval", deny)
+    conflict = asyncio.run(main._run_tool("move_path", {
+        "source": "exists.txt", "destination": "exists.txt"}, project, "workspace", task_id=task_id))
+    assert "already exists" in conflict
+    denied = asyncio.run(main._run_tool("delete_path", {"path": "exists.txt"},
+        project, "workspace", task_id=task_id))
+    assert "denied" in denied.lower()
+    outside = asyncio.run(main._run_tool("delete_path", {"path": "../outside"},
+        project, "workspace", task_id=task_id))
+    assert "outside" in outside.lower()
+    assert (project / "exists.txt").exists()
+
+
+def test_move_restore_removes_only_verified_duplicate(tmp_path, monkeypatch):
+    isolate(tmp_path, monkeypatch)
+    project = tmp_path / "project"
+    project.mkdir()
+    source = project / "source.txt"
+    moved = project / "moved.txt"
+    source.write_text("original", encoding="utf-8")
+    moved.write_text("original", encoding="utf-8")
+    projects.open_project(str(project))
+    task_id = main._create_task(main.TaskInput(message="move", mode="workspace"))
+    change_id = main._save_operation(task_id, "source.txt", "move", b"original", "moved.txt")
+    db = main._db()
+    digest = main.hashlib.sha256(b"original").hexdigest()
+    db.execute("UPDATE file_changes SET after_hash=?,status='applied' WHERE id=?",
+               (digest, change_id))
+    db.commit()
+    db.close()
+
+    client = TestClient(main.app)
+    response = client.post(f"/api/changes/{change_id}/restore")
+    assert response.status_code == 200
+    assert source.read_text(encoding="utf-8") == "original"
+    assert not moved.exists()
+
+    second = project / "second.txt"
+    duplicate = project / "duplicate.txt"
+    second.write_text("changed", encoding="utf-8")
+    duplicate.write_text("original", encoding="utf-8")
+    other_id = main._save_operation(task_id, "second.txt", "move", b"original", "duplicate.txt")
+    db = main._db()
+    db.execute("UPDATE file_changes SET after_hash=?,status='applied' WHERE id=?",
+               (digest, other_id))
+    db.commit()
+    db.close()
+
+    blocked = client.post(f"/api/changes/{other_id}/restore")
+    assert blocked.status_code == 409
+    assert second.read_text(encoding="utf-8") == "changed"
+    assert duplicate.read_text(encoding="utf-8") == "original"
+
+
+def test_interrupted_task_resumes_only_when_no_tool_started(tmp_path, monkeypatch):
+    isolate(tmp_path, monkeypatch)
+    project = tmp_path / "project"
+    project.mkdir()
+    projects.open_project(str(project))
+    task_id = main._create_task(main.TaskInput(message="inspect", mode="workspace"))
+    main._set_task(task_id, "interrupted", "server stopped")
+    assert main._task_state(task_id)["can_resume"] is True
+    outcomes = []
+
+    async def run_job(task_id, task, cancel):
+        outcomes.append((task_id, task.mode))
+        main._set_task(task_id, "completed")
+
+    monkeypatch.setattr(main, "_run_job", run_job)
+    with TestClient(main.app) as client:
+        response = client.post(f"/api/tasks/{task_id}/resume", json={"mode": "read_only"})
+        assert response.status_code == 200
+        assert response.json()["mode"] == "read_only"
+        for _ in range(20):
+            if outcomes:
+                break
+            __import__("time").sleep(0.01)
+        assert outcomes == [(task_id, "read_only")]
+
+    second = main._create_task(main.TaskInput(message="inspect"))
+    main._task_event(second, "tool", "Started write_file")
+    main._set_task(second, "interrupted", "server stopped")
+    assert main._task_state(second)["can_resume"] is False
+    with TestClient(main.app) as client:
+        blocked = client.post(f"/api/tasks/{second}/resume", json={"mode": "workspace"})
+    assert blocked.status_code == 409
+    assert "cannot be replayed safely" in blocked.json()["detail"]
+
+
+def test_skills_install_enable_inspect_and_remove_as_untrusted_data(tmp_path, monkeypatch):
+    isolate(tmp_path, monkeypatch)
+    source = tmp_path / "sample-skill"
+    source.mkdir()
+    (source / "skill.json").write_text(json.dumps({
+        "name": "review-notes", "description": "Review small changes.", "version": "1.0.0",
+        "tools": ["read_file"]}), encoding="utf-8")
+    (source / "SKILL.md").write_text("Check correctness and tests.", encoding="utf-8")
+    (source / "unused.py").write_text("raise RuntimeError('must not run')", encoding="utf-8")
+    client = TestClient(main.app)
+    installed = client.post("/api/skills/install", json={"source": str(source)})
+    assert installed.status_code == 200
+    skill_id = installed.json()["id"]
+    assert installed.json()["enabled"] is False
+    enabled = client.put(f"/api/skills/{skill_id}/enabled", json={"enabled": True})
+    assert enabled.status_code == 200
+    detail = client.get(f"/api/skills/{skill_id}").json()
+    assert detail["instructions"] == "Check correctness and tests."
+    assert "unused.py" in detail["files"]
+    assert skills.enabled_instructions() == [(skill_id, "Check correctness and tests.")]
+    assert client.delete(f"/api/skills/{skill_id}").status_code == 200
+    assert client.get("/api/skills").json()["skills"] == []
+
+
+def test_skills_reject_invalid_metadata_and_traversal(tmp_path, monkeypatch):
+    isolate(tmp_path, monkeypatch)
+    source = tmp_path / "bad-skill"
+    source.mkdir()
+    (source / "skill.json").write_text("{}", encoding="utf-8")
+    (source / "SKILL.md").write_text("instructions", encoding="utf-8")
+    with TestClient(main.app) as client:
+        bad = client.post("/api/skills/install", json={"source": str(source)})
+    assert bad.status_code == 422
+    with pytest.raises(Exception, match="Skill ID"):
+        skills.inspect_skill("../providers")
+
+
+def test_mcp_http_connect_enable_and_tool_call(tmp_path, monkeypatch):
+    isolate(tmp_path, monkeypatch)
+    replies = [
+        {"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": mcp_client.MODERN}},
+        {"jsonrpc": "2.0", "id": 2, "result": {"tools": [{
+            "name": "lookup", "description": "Look up a value", "inputSchema": {
+                "type": "object", "properties": {
+                    "query": {"type": "string"},
+                    "region": {"type": "string", "x-mcp-header": "Region"}},
+                "required": ["query"], "additionalProperties": False}}]}},
+        {"jsonrpc": "2.0", "id": 99, "result": {"content": [
+            {"type": "text", "text": "Found one safe result."}]}},
+    ]
+    calls = []
+
+    class Reply:
+        status_code = 200
+        headers = {"content-type": "application/json"}
+        def __init__(self, data): self.text = json.dumps(data)
+
+    class Client:
+        def __init__(self, **kwargs): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): pass
+        async def post(self, url, headers, json):
+            calls.append((headers, json))
+            return Reply(replies.pop(0))
+
+    monkeypatch.setattr(mcp_client.httpx, "AsyncClient", Client)
+    server = mcp_client.add_server("Local tools", "http://127.0.0.1:8000/mcp")
+    assert server["enabled"] is False
+    connected = asyncio.run(mcp_client.connect_server(server["id"]))
+    assert connected["connected"] is True
+    assert connected["protocol"] == mcp_client.MODERN
+    assert connected["tools"][0]["name"] == "lookup"
+    pending = mcp_client.add_server("Not connected", "http://127.0.0.1:8001/mcp")
+    with pytest.raises(Exception, match="before enabling"):
+        mcp_client.set_enabled(pending["id"], True)
+    enabled = mcp_client.set_enabled(server["id"], True)
+    assert enabled["enabled"] is True
+    spec = mcp_client.tool_specs()[0]["function"]
+    assert spec["name"].startswith("mcp_")
+    answer = asyncio.run(mcp_client.call_tool(spec["name"], {"query": "hello", "region": "ap-south-1"}))
+    assert answer == "Found one safe result."
+    assert calls[-1][0]["Mcp-Method"] == "tools/call"
+    assert calls[-1][0]["Mcp-Name"] == "lookup"
+    assert calls[-1][0]["Mcp-Param-Region"] == "ap-south-1"
+    assert calls[-1][1]["params"]["arguments"] == {"query": "hello", "region": "ap-south-1"}
+    with pytest.raises(ValueError, match="required fields"):
+        asyncio.run(mcp_client.call_tool(spec["name"], {}))
+    mcp_client.remove_server(server["id"])
+    mcp_client.remove_server(pending["id"])
+    assert mcp_client.list_servers() == []
+
+
+def test_mcp_rejects_plain_remote_urls_and_bad_addresses(tmp_path, monkeypatch):
+    isolate(tmp_path, monkeypatch)
+    with pytest.raises(Exception, match="HTTPS"):
+        mcp_client.add_server("Remote", "http://10.0.0.1/mcp")
+    monkeypatch.setattr(mcp_client.socket, "getaddrinfo", lambda *args: [
+        (None, None, None, None, ("10.0.0.5", 0))])
+    with pytest.raises(Exception, match="public addresses"):
+        mcp_client._check_address("https://mcp.example/mcp")
+
+
+def test_mcp_modern_transport_against_local_http_fixture(tmp_path, monkeypatch):
+    isolate(tmp_path, monkeypatch)
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            request = json.loads(self.rfile.read(length))
+            method = request["method"]
+            assert self.headers.get("MCP-Protocol-Version") == mcp_client.MODERN
+            assert self.headers.get("Mcp-Method") == method
+            if method == "server/discover":
+                assert request["params"]["_meta"][
+                    "io.modelcontextprotocol/protocolVersion"] == mcp_client.MODERN
+                result = {"protocolVersion": mcp_client.MODERN}
+            elif method == "tools/list":
+                result = {"tools": [{"name": "ping", "inputSchema": {
+                    "type": "object", "properties": {}, "additionalProperties": False}}]}
+            elif method == "tools/call":
+                assert self.headers.get("Mcp-Name") == "ping"
+                result = {"content": [{"type": "text", "text": "pong"}]}
+            else:
+                self.send_error(404)
+                return
+            body = json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        def log_message(self, *args): pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        item = mcp_client.add_server("Fixture", f"http://127.0.0.1:{server.server_port}/mcp")
+        connected = asyncio.run(mcp_client.connect_server(item["id"]))
+        mcp_client.set_enabled(item["id"], True)
+        alias = mcp_client.tool_specs()[0]["function"]["name"]
+        assert connected["protocol"] == mcp_client.MODERN
+        assert asyncio.run(mcp_client.call_tool(alias, {})) == "pong"
+    finally:
+        mcp_client.sessions.clear()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_browser_network_filter_and_missing_runtime_status(monkeypatch):
+    monkeypatch.setattr(browser_tools.socket, "getaddrinfo", lambda *args: [
+        (None, None, None, None, ("8.8.8.8", 0))])
+    assert asyncio.run(browser_tools._allowed("https://example.com", False)) is True
+    assert asyncio.run(browser_tools._allowed("http://example.com", True)) is False
+    assert asyncio.run(browser_tools._allowed("https://127.0.0.1:8000", False)) is False
+    assert asyncio.run(browser_tools._allowed("http://127.0.0.1:8000", True)) is True
+    assert asyncio.run(browser_tools._allowed("file:///C:/secret.txt", True)) is False
+    assert browser_tools.status()["active"] is False
+
+
+def test_browser_plays_local_fixture_and_cleans_up(tmp_path, monkeypatch):
+    pytest.importorskip("playwright.async_api")
+    monkeypatch.setattr(browser_tools, "_screens", tmp_path / "screenshots")
+    html = b"<!doctype html><title>Start</title><h1>Local test page</h1>"
+    html += b"<input id='name'><button id='go' onclick=\"document.title='Clicked'\">Go</button>"
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(html)))
+            self.end_headers()
+            self.wfile.write(html)
+        def log_message(self, *args): pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    async def run():
+        try:
+            state = await browser_tools.start(allow_local=True)
+            assert state["active"] is True
+            url = f"http://127.0.0.1:{server.server_port}/"
+            await browser_tools.navigate(url)
+            await browser_tools.wait_for("#name", "visible")
+            await browser_tools.fill("#name", "Luna")
+            page = await browser_tools.inspect_page()
+            assert "Local test page" in page["text"]
+            await browser_tools.click("#go")
+            shot = await browser_tools.screenshot()
+            assert browser_tools.screenshot_path(shot["name"]).is_file()
+            state = await browser_tools.close()
+            assert state["installed"] is True and state["active"] is False
+        finally:
+            if browser_tools.status()["active"]:
+                await browser_tools.close()
+    try:
+        asyncio.run(run())
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_desktop_automation_requires_enable_and_checks_selected_controls(tmp_path, monkeypatch):
+    import sys
+    from types import SimpleNamespace
+
+    class Control:
+        element_info = SimpleNamespace(control_type="Edit", automation_id="search")
+        def __init__(self): self.value = ""; self.clicked = False
+        def window_text(self): return "Search box"
+        def is_enabled(self): return True
+        def click_input(self): self.clicked = True
+        def set_edit_text(self, value): self.value = value
+
+    control = Control()
+
+    class Window:
+        handle = 123
+        def exists(self, timeout=1): return True
+        def window_text(self): return "Harmless Test Window"
+        def class_name(self): return "TestWindow"
+        def descendants(self): return [control]
+
+    window = Window()
+
+    class Desktop:
+        def __init__(self, backend): assert backend == "uia"
+        def windows(self, top_level_only=True): return [window]
+        def window(self, handle): assert handle == 123; return window
+
+    monkeypatch.setitem(sys.modules, "pywinauto", SimpleNamespace(Desktop=Desktop))
+    monkeypatch.setattr(desktop_tools, "SCREEN_DIR", tmp_path / "screens")
+    assert desktop_tools.status()["available"] is True
+    with pytest.raises(Exception, match="Enable desktop"):
+        desktop_tools.windows()
+    desktop_tools.set_enabled(True)
+    assert desktop_tools.windows()[0]["title"] == "Harmless Test Window"
+    desktop_tools.select("0x7b")
+    assert desktop_tools.inspect("0x7b")["controls"][0]["automation_id"] == "search"
+    assert desktop_tools.click("0x7b", 0)["ok"] is True
+    assert control.clicked is True
+    desktop_tools.type_text("0x7b", 0, "safe text")
+    assert control.value == "safe text"
+    with pytest.raises(Exception, match="Credential-like"):
+        desktop_tools.type_text("0x7b", 0, "API_KEY=private-value-123")
+    assert all(item["function"]["name"] != "desktop_windows"
+               for item in desktop_tools.tool_specs())
+    desktop_tools.set_enabled(False)

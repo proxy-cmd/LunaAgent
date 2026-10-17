@@ -1,0 +1,6 @@
+{
+  "name": "review-notes",
+  "description": "A short checklist for reviewing a small code change.",
+  "version": "1.0.0",
+  "tools": []
+}

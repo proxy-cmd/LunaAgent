@@ -1,0 +1,61 @@
+# Luna Desk project status
+
+## Implemented
+
+- First-run provider setup with prefilled Apinex settings, masked key entry,
+  connection testing, provider editing, default selection, and key removal.
+- Local provider configuration in an ignored `.env` file and non-secret
+  provider metadata under `.luna`.
+- Chat Completions and Responses request support, tool-call normalization,
+  streaming events, task cancellation, safe task resume, and persisted history.
+- Project selection and inspection; bounded file search and reads; guarded
+  writes, moves, deletes, diffs, and conflict-checked restore.
+- Explicit approval for risky file, shell, browser, desktop, and MCP actions.
+- Optional skills, Playwright browser automation, Windows UI Automation, and
+  HTTP MCP server integrations. Optional runtimes are documented separately.
+- A local-only FastAPI service, launcher, README, and backend/frontend tests.
+
+## Known limits
+
+- The folder chooser is a path field, not a native file picker.
+- Windows command execution is not an OS-level sandbox. Commands run as the
+  current user, so approvals do not restrict all possible filesystem access.
+- Desktop automation was exercised with a real UIA click. Desktop text entry
+  has mock coverage but has not been verified against a real application.
+- Browser automation has an actual local Playwright fixture test. Public-site
+  interaction was not exercised as part of this pass.
+- MCP was tested against a controlled local HTTP fixture. OAuth, stdio
+  transports, and long-lived subscriptions are not implemented.
+- Provider streaming and Responses tool cycles are covered by mocked tests;
+  they were not verified live with Apinex during this pass.
+- Restoring moves of directories recreates file entries, but empty nested
+  directories are not represented in the file change records.
+- A live agent tool cycle ran, but its exact-output assertion failed because
+  the model added punctuation. A correction attempt was rate limited.
+
+## Live provider check
+
+The configured Apinex Chat Completions connection test succeeded for
+`free/gpt-6-luna`, returned that model name, and reported 313 total tokens.
+The key is stored in the local ignored `.env` file and is not included here.
+It was exposed in chat during setup; rotate it after verification.
+
+## Verification
+
+- `python -m pytest -q`: **42 passed, 1 skipped**. The skip is the real-browser
+  fixture because the global Python environment has no Playwright runtime.
+- `.venv\Scripts\python.exe -m pytest -q`: **43 passed**. Starlette emitted
+  one AnyIO `BlockingPortal` deprecation warning.
+- Frontend JavaScript passed `node --check`.
+- `git diff --check` passed; Git reported only its LF-to-CRLF normalization
+  notice for changed files.
+- `run.ps1 -NoBrowser` started successfully. The page, setup status, providers,
+  skills, MCP, browser status, desktop status, projects, and history endpoints
+  all returned HTTP 200.
+- The real Playwright browser fixture passed in the virtual environment.
+- A harmless real UI Automation click passed. Desktop typing was mock-tested.
+- The live Apinex connection test passed. The live agent interaction reached
+  tool execution but failed the exact-text assertion; a retry hit a provider
+  rate limit. Responses and streaming behavior remain mock-verified.
+
+No commit or push is part of this task.

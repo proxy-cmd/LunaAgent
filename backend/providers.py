@@ -155,6 +155,16 @@ def _error(status: int, body: str) -> tuple[str, str]:
     return "provider_error", "The provider returned HTTP " + str(status) + "."
 
 
+def _hide_key(value, key: str):
+    if isinstance(value, str):
+        return value.replace(key, "[redacted]") if key else value
+    if isinstance(value, list):
+        return [_hide_key(item, key) for item in value]
+    if isinstance(value, dict):
+        return {str(name): _hide_key(item, key) for name, item in value.items()}
+    return value
+
+
 async def test_connection(item: ProviderInput, key: str) -> dict:
     base_url = validate(item)
     endpoint = "/responses" if item.protocol == "responses" else "/chat/completions"
@@ -181,8 +191,11 @@ async def test_connection(item: ProviderInput, key: str) -> dict:
     valid = (isinstance(data.get("choices"), list) and bool(data["choices"])) if item.protocol == "chat_completions" else (isinstance(data.get("output"), list) or isinstance(data.get("output_text"), str))
     if not valid:
         return {"ok": False, "category": "invalid_response", "message": "Provider response did not contain a completion result."}
+    actual_model = data.get("model")
+    if not isinstance(actual_model, str) or not actual_model:
+        actual_model = item.model
     return {"ok": True, "category": "success", "message": "Connection test succeeded.",
-            "model": data.get("model") or item.model, "usage": data.get("usage")}
+            "model": _hide_key(actual_model, key), "usage": _hide_key(data.get("usage"), key)}
 
 
 def save_provider(item: ProviderInput, provider_id: str | None = None) -> dict:

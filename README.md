@@ -1,18 +1,18 @@
-﻿# Luna Desk
+# Luna Desk
 
-Luna Desk is a local-first coding assistant with configurable OpenAI-compatible providers and a bounded workspace agent.
+Luna Desk is a local-first coding assistant. It stores provider settings, project history, and automation data on this computer. The server binds to `127.0.0.1`.
 
-## Run on Windows
+## Start on Windows
 
-Python 3.11 or newer is required. From PowerShell in this folder:
+Python 3.11 or newer is required. In PowerShell, from this folder, run:
 
 ```powershell
 .\run.ps1
 ```
 
-Then open http://127.0.0.1:8765. On first launch the setup page prefills Apinex (`https://api.apinex.bond/v1`, model `free/gpt-6-luna`). Enter your API key, test the connection, save the provider, then finish setup. Settings and help remain available without a working connection.
+Open http://127.0.0.1:8765. First-run settings use Apinex (`https://api.apinex.bond/v1`), model `free/gpt-6-luna`, and Chat Completions. Enter a key, choose **Test Connection**, save the provider, then finish setup. Settings, skills, automation setup, help, and diagnostics remain available if AI is offline.
 
-Manual launch:
+For a manual launch:
 
 ```powershell
 python -m venv .venv
@@ -21,18 +21,54 @@ python -m pip install -r requirements.txt
 python -m uvicorn backend.main:app --host 127.0.0.1 --port 8765
 ```
 
-## Providers and key storage
+## Providers and keys
 
-Add and edit providers in Settings. Chat Completions and Responses connection tests make a real minimal request. The result includes the model and usage when returned. Provider status errors distinguish authentication, balance, quota, rate limit, unsupported protocol, and network failures.
+The Settings page supports multiple OpenAI-compatible providers, Chat Completions, and Responses. Connection tests make a real, small request and report the returned model and usage. Agent tasks use the selected protocol and do not silently switch providers or models.
 
-Provider metadata is stored in `.luna/providers.json`; keys are stored separately in the gitignored `.env`. The API only returns whether a key is configured. Change a key by editing a provider and entering a replacement; remove a key or remove the provider from its provider card. Luna does not switch the default provider automatically when the default is removed.
+Provider metadata lives in `.luna/providers.json`; API keys live in the ignored root `.env`. The settings API returns only whether a key exists. Use **Change key** or **Remove key** in the provider card. The `.env` file is local plaintext protected by the current Windows account’s file permissions. Do not share it. Rotate a key if it has been exposed.
 
-## Workspace agent
+## Projects and agent tasks
 
-The workspace accepts a task and a selected folder. Read-only mode permits listing and reading files. Workspace mode additionally permits file writes and PowerShell commands in the chosen folder. The agent uses the selected provider's Chat Completions tool-call API and configured iteration limit. Task summaries are stored locally in `.luna/history.sqlite3`.
+Open **Workspace**, enter an existing folder path, and choose **Open Project**. Browsers cannot browse arbitrary host folders, so Luna uses a path field. Project inspection reports common manifests, languages, likely entry points, scripts, Git status, and whether `AGENTS.md` exists; it does not run project code.
 
-Run `python -m pytest` for automated tests. Provider HTTP responses are mocked in unit tests; tests do not use an API key or consume quota.
+Read-only mode can list, search, and read bounded text files. Workspace mode can also edit files, run approved commands, move files or directories, and delete files or directories. Destructive file operations require a separate approval. File changes have snapshots and diffs; restore checks the current file before changing it. Credential files, Git metadata, symlinks, and paths outside the active project are blocked.
 
-## Current limits
+The agent streams provider text and task events to the page with Server-Sent Events. Chat Completions and Responses tool calls use the same bounded workspace tools. Interrupted tasks can be resumed from the beginning only when no tool started before the interruption; resume defaults to read-only. Task history and events are stored in `.luna/history.sqlite3`.
 
-This initial implementation does not yet support streaming task responses, task cancellation/resume, Responses-protocol agent tool calling, diff/restore review, explicit approval dialogs for individual commands, browser or desktop control, skills management, or MCP integrations. Task execution requires a compatible provider with tool calling. Run only on the local machine; the launcher binds to `127.0.0.1`.
+Commands outside the narrow test/build/Git-inspection allowlist pause for approval. Approved PowerShell commands still run as the current Windows user and are not OS-sandboxed. The application does not authenticate other local processes running as the same user.
+
+## Skills
+
+Skills are local folders with `skill.json`, `SKILL.md`, and optional supporting files. `examples/skills/review-notes` is a starter. Install one from the Settings page using its full folder path, inspect it, then enable it. Luna treats skill text as untrusted guidance, limits the total instructions sent with a task, and never executes skill scripts. Skills cannot add tools or bypass approval policy.
+
+## MCP servers
+
+Luna supports MCP Streamable HTTP servers. Add a server in Settings, connect to inspect its tools, then explicitly enable it. Each tool call pauses for approval. Luna does not launch server commands or send the provider key to an MCP server. Remote servers require HTTPS and public DNS addresses; plain HTTP is restricted to an explicitly configured loopback server.
+
+The client negotiates modern MCP `2026-07-28` and falls back to the `2025-11-25` handshake for older servers. It supports tool discovery and calls, JSON/SSE responses, and `x-mcp-header` parameters. It does not support stdio process launch, OAuth credential management, long-lived subscriptions, or multi-round-trip input requests. [MCP Streamable HTTP specification](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http).
+
+## Browser automation
+
+Install the optional runtime and Chromium from PowerShell:
+
+```powershell
+python -m pip install -r requirements-browser.txt
+python -m playwright install chromium
+```
+
+Start a browser session in Settings. It uses a fresh, headless Chromium context without saved cookies or downloads. Public HTTPS sites are allowed; localhost is blocked unless enabled for that browser session. Browser page text is untrusted and bounded. Clicks and form fills from an agent require approval, and credential-like text cannot be entered. Screenshots stay under ignored `.luna/browser/` storage.
+
+## Windows desktop automation
+
+Install the optional package with `python -m pip install -r requirements-desktop.txt`, then enable desktop access in Settings. Luna only inspects the window you select. Clicks and typing require approval; credential-like text is blocked. It does not start applications, elevate privileges, or bypass UAC. UI Automation support varies by application; inaccessible controls fail clearly. Screenshots stay under ignored `.luna/desktop/` storage.
+
+## Tests and limits
+
+Run the automated suite with:
+
+```powershell
+python -m pip install -r requirements-dev.txt
+python -m pytest -q
+```
+
+With the browser extra and Chromium installed, the same suite runs a real Playwright interaction against a local fixture. Without it, that test is skipped. Tests do not use provider credentials. The application does not yet support safe resume after any tool has started, task-history deletion, custom provider headers, browser file uploads/downloads, or full MCP extensions. Nested empty folders inside non-empty trees may remain after restoring individual file operations. There is no native folder picker or end-to-end browser UI test.

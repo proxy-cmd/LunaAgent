@@ -2,7 +2,7 @@ import asyncio
 
 from fastapi.testclient import TestClient
 
-from backend import main, providers
+from backend import main, projects, providers
 
 
 def isolate(tmp_path, monkeypatch):
@@ -10,6 +10,7 @@ def isolate(tmp_path, monkeypatch):
     monkeypatch.setattr(providers, "PROVIDERS_FILE", tmp_path / "providers.json")
     monkeypatch.setattr(providers, "ENV_FILE", tmp_path / ".env")
     monkeypatch.setattr(main, "DB", tmp_path / "history.sqlite3")
+    monkeypatch.setattr(projects, "SETTINGS_FILE", tmp_path / "settings.json")
 
 
 def payload(**updates):
@@ -48,6 +49,15 @@ def test_validation_errors_do_not_echo_api_keys():
     assert marker not in response.text
 
 
+def test_command_environment_does_not_inherit_credentials(monkeypatch):
+    monkeypatch.setenv("LUNA_TEST_API_KEY", "secret-value")
+    monkeypatch.setenv("LUNA_TEST_TOKEN", "token-value")
+    environment = main._command_environment()
+    assert "LUNA_TEST_API_KEY" not in environment
+    assert "LUNA_TEST_TOKEN" not in environment
+    assert main._redact_text("API_KEY=secret-value-123") == "[redacted]"
+
+
 def test_error_categories():
     assert providers._error(401, "{}")[0] == "authentication"
     assert providers._error(402, "{}")[0] == "balance"
@@ -62,7 +72,8 @@ def test_connection_test_requires_a_completion(monkeypatch):
         status_code = 200
         text = ""
         def json(self):
-            return {"model": "served-model", "choices": [{"message": {"content": "OK"}}], "usage": {"total_tokens": 3}}
+            return {"model": "served-model", "choices": [{"message": {"content": "OK"}}],
+                    "usage": {"total_tokens": 3, "note": "secret-test-value"}}
 
     class Client:
         def __init__(self, **kwargs): pass
@@ -75,6 +86,33 @@ def test_connection_test_requires_a_completion(monkeypatch):
     assert result["ok"] is True
     assert result["model"] == "served-model"
     assert result["usage"]["total_tokens"] == 3
+    assert "secret-test-value" not in str(result)
+
+
+def test_responses_connection_uses_responses_endpoint(monkeypatch):
+    calls = []
+
+    class Response:
+        status_code = 200
+        def json(self):
+            return {"model": "responses-model", "output": [{"type": "message"}],
+                    "usage": {"input_tokens": 2, "output_tokens": 1}}
+
+    class Client:
+        def __init__(self, **kwargs): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): pass
+        async def post(self, url, **kwargs):
+            calls.append((url, kwargs["json"]))
+            return Response()
+
+    monkeypatch.setattr(providers.httpx, "AsyncClient", Client)
+    result = asyncio.run(providers.test_connection(
+        providers.ProviderInput(**payload(protocol="responses")), "secret-test-value"))
+    assert result["ok"] is True
+    assert result["model"] == "responses-model"
+    assert calls[0][0].endswith("/responses")
+    assert calls[0][1]["input"] == "Reply with OK."
 
 
 def test_successful_test_is_required_to_finish_setup(tmp_path, monkeypatch):
@@ -152,6 +190,231 @@ def test_workspace_paths_and_read_only_mode(tmp_path):
     result = asyncio.run(main._run_tool("write_file", {"path": "x.txt", "content": "x"}, root, "read_only"))
     assert "Permission denied" in result
     assert not (root / "x.txt").exists()
+
+
+def test_file_tools_protect_secrets_and_detect_stale_edits(tmp_path):
+    root = tmp_path / "project"
+    root.mkdir()
+    (root / ".env").write_text("SECRET=do-not-read", encoding="utf-8")
+    target = root / "code.py"
+    target.write_text("before", encoding="utf-8")
+    (root / "config.py").write_text('API_KEY="super-secret-value-123"', encoding="utf-8")
+    secret_result = asyncio.run(main._run_tool("read_file", {"path": ".env"}, root, "read_only"))
+    assert "Permission denied" in secret_result
+    content_secret = asyncio.run(main._run_tool("read_file", {"path": "config.py"}, root, "read_only"))
+    assert "super-secret-value-123" not in content_secret
+    assert "Permission denied" in content_secret
+
+    stale = asyncio.run(main._run_tool("write_file", {
+        "path": "code.py", "content": "after", "expected_sha256": "wrong-hash",
+    }, root, "workspace"))
+    assert "conflict" in stale.lower()
+    assert target.read_text(encoding="utf-8") == "before"
+
+    digest = __import__("hashlib").sha256(b"before").hexdigest()
+    updated = asyncio.run(main._run_tool("write_file", {
+        "path": "code.py", "content": "after", "expected_sha256": digest,
+    }, root, "workspace"))
+    assert "updated" in updated
+    assert target.read_text(encoding="utf-8") == "after"
+
+
+def test_project_selection_persists_and_recent_removal_keeps_directory(tmp_path, monkeypatch):
+    isolate(tmp_path, monkeypatch)
+    project = tmp_path / "my-project"
+    project.mkdir()
+    (project / "pyproject.toml").write_text("[project]\nname='demo'", encoding="utf-8")
+    (project / "AGENTS.md").write_text("untrusted instructions", encoding="utf-8")
+    client = TestClient(main.app)
+    opened = client.post("/api/projects/open", json={"path": str(project)})
+    assert opened.status_code == 200
+    assert opened.json()["active_project"] == str(project.resolve())
+    inspected = client.post("/api/projects/inspect", json={"path": str(project)})
+    assert "pyproject.toml" in inspected.json()["manifests"]
+    assert inspected.json()["has_agent_instructions"] is True
+    removed = client.request("DELETE", "/api/projects/recent", json={"path": str(project)})
+    assert removed.status_code == 200
+    assert project.is_dir()
+    assert removed.json()["active_project"] == str(project.resolve())
+
+
+def test_project_rejects_missing_folder(tmp_path, monkeypatch):
+    isolate(tmp_path, monkeypatch)
+    response = TestClient(main.app).post("/api/projects/open", json={"path": str(tmp_path / "missing")})
+    assert response.status_code == 422
+
+
+def test_project_summary_reports_framework_without_returning_script_body(tmp_path):
+    project = tmp_path / "react-app"
+    project.mkdir()
+    (project / "package.json").write_text(
+        '{"dependencies":{"react":"1"},"scripts":{"test":"echo private-token-should-not-leak"}}',
+        encoding="utf-8",
+    )
+    summary = projects.inspect_project(str(project))
+    assert summary["frameworks"] == ["react"]
+    assert summary["package_script_names"] == ["test"]
+    assert "private-token-should-not-leak" not in str(summary)
+
+
+def test_mock_agent_reads_writes_and_verifies_inside_active_project(tmp_path, monkeypatch):
+    isolate(tmp_path, monkeypatch)
+    project = tmp_path / "selected-project"
+    project.mkdir()
+    (project / "notes.txt").write_text("initial", encoding="utf-8")
+    projects.open_project(str(project))
+    providers.save_provider(providers.ProviderInput(**payload()))
+
+    def answer(name=None, args=None, content=None):
+        message = {"content": content, "tool_calls": []}
+        if name:
+            message["tool_calls"] = [{"id": "call-" + name, "type": "function",
+                "function": {"name": name, "arguments": __import__("json").dumps(args)}}]
+        return {"choices": [{"message": message}], "model": "mock-model"}
+
+    responses = [
+        answer("list_files", {"path": "."}),
+        answer("read_file", {"path": "notes.txt"}),
+        answer("write_file", {"path": "result.txt", "content": "verified", "expected_sha256": None}),
+        answer("read_file", {"path": "result.txt"}),
+        answer(content="Created result.txt and read it back successfully."),
+    ]
+
+    class Response:
+        status_code = 200
+        def __init__(self, value): self.value = value
+        def json(self): return self.value
+
+    class Client:
+        def __init__(self, **kwargs): self.index = 0
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): pass
+        async def post(self, *args, **kwargs):
+            result = responses[self.index]
+            self.index += 1
+            return Response(result)
+
+    monkeypatch.setattr(main.httpx, "AsyncClient", Client)
+    task = main.TaskInput(message="Create result.txt", mode="workspace")
+    result = asyncio.run(main._agent(task))
+    assert result["answer"].startswith("Created result.txt")
+    assert (project / "result.txt").read_text(encoding="utf-8") == "verified"
+    assert "secret-test-value" not in (tmp_path / "history.sqlite3").read_bytes().decode("latin1")
+    assert main.history()["tasks"][0]["workspace"] == str(project.resolve())
+
+
+def test_task_endpoint_can_cancel_and_records_status(tmp_path, monkeypatch):
+    isolate(tmp_path, monkeypatch)
+    project = tmp_path / "active"
+    project.mkdir()
+    projects.open_project(str(project))
+    providers.save_provider(providers.ProviderInput(**payload()))
+
+    class Client:
+        def __init__(self, **kwargs): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): pass
+        async def post(self, *args, **kwargs): await asyncio.sleep(30)
+
+    monkeypatch.setattr(main.httpx, "AsyncClient", Client)
+    client = TestClient(main.app)
+    started = client.post("/api/tasks", json={"message": "inspect the project"}).json()
+    assert started["status"] == "running"
+    cancelled = client.delete("/api/tasks/" + str(started["id"]))
+    assert cancelled.status_code == 200
+    for _ in range(30):
+        state = client.get("/api/tasks/" + str(started["id"])).json()
+        if state["status"] == "cancelled":
+            break
+        __import__("time").sleep(0.01)
+    assert state["status"] == "cancelled"
+    assert state["events"][-1]["detail"] == "Task cancelled"
+
+
+def test_mocked_task_endpoint_persists_redacted_completed_task(tmp_path, monkeypatch):
+    isolate(tmp_path, monkeypatch)
+    project = tmp_path / "task-project"
+    project.mkdir()
+    projects.open_project(str(project))
+    providers.save_provider(providers.ProviderInput(**payload()))
+    seen = []
+
+    class Response:
+        status_code = 200
+        def json(self):
+            return {"model": "mock-model", "choices": [{"message": {
+                "content": "Task checked.", "tool_calls": []}}]}
+
+    class Client:
+        def __init__(self, **kwargs): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): pass
+        async def post(self, url, **kwargs):
+            seen.extend(kwargs["json"]["messages"])
+            return Response()
+
+    monkeypatch.setattr(main.httpx, "AsyncClient", Client)
+    client = TestClient(main.app)
+    secret = "API_KEY=superSecretValue123"
+    started = client.post("/api/tasks", json={"message": "Inspect " + secret}).json()
+    state = client.get(f"/api/tasks/{started['id']}").json()
+    assert state["status"] == "completed"
+    assert secret not in state["message"]
+    assert secret not in str(seen)
+    assert state["answer"] == "Task checked."
+
+
+def test_local_web_guard_rejects_foreign_origin_and_host():
+    client = TestClient(main.app)
+    foreign_origin = client.get("/api/projects", headers={"origin": "http://evil.example"})
+    bad_host = client.get("/api/projects", headers={"host": "luna.evil.example"})
+    assert foreign_origin.status_code == 403
+    assert bad_host.status_code == 400
+
+
+def test_risky_commands_wait_for_explicit_user_approval(tmp_path, monkeypatch):
+    isolate(tmp_path, monkeypatch)
+    project = tmp_path / "approval-project"
+    project.mkdir()
+    projects.open_project(str(project))
+    task_id = main._create_task(main.TaskInput(message="run a command"))
+    assert main._command_needs_approval("python -m pytest") is False
+    assert main._command_needs_approval("Remove-Item important.txt") is True
+
+    async def check():
+        waiting = asyncio.create_task(main._request_approval(
+            task_id, "Remove-Item important.txt", asyncio.Event()))
+        await asyncio.sleep(0)
+        assert main._task_state(task_id)["status"] == "awaiting_approval"
+        assert main._task_state(task_id)["approval"]["command"] == "Remove-Item important.txt"
+        main.decide_command(task_id, main.ApprovalInput(approved=True))
+        return await waiting
+
+    assert asyncio.run(check()) is True
+    assert main._task_state(task_id)["status"] == "running"
+
+
+def test_task_diff_snapshot_and_safe_restore(tmp_path, monkeypatch):
+    isolate(tmp_path, monkeypatch)
+    project = tmp_path / "change-project"
+    project.mkdir()
+    target = project / "source.py"
+    target.write_text("old value\n", encoding="utf-8")
+    projects.open_project(str(project))
+    task_id = main._create_task(main.TaskInput(message="update source"))
+    old_hash = __import__("hashlib").sha256(target.read_bytes()).hexdigest()
+    result = asyncio.run(main._run_tool("write_file", {
+        "path": "source.py", "content": "new value\n", "expected_sha256": old_hash,
+    }, project, "workspace", task_id=task_id))
+    assert "updated" in result
+    client = TestClient(main.app)
+    change = client.get(f"/api/tasks/{task_id}/changes").json()["changes"][0]
+    assert "-old value" in change["diff"]
+    assert "+new value" in change["diff"]
+    restored = client.post(f"/api/changes/{change['id']}/restore")
+    assert restored.status_code == 200
+    assert target.read_text(encoding="utf-8") == "old value\n"
+    assert client.get(f"/api/tasks/{task_id}/changes").json()["changes"][0]["status"] == "restored"
 
 
 def test_gitignore_excludes_secrets_and_local_database():
