@@ -149,3 +149,67 @@ def test_native_integrations_settings_share_existing_apis(app, monkeypatch):
     assert "browser automation" in dialog.browser_status.text()
     assert not dialog.desktop_toggle.isEnabled()
     dialog.close()
+
+
+def test_terminal_uses_owned_persistent_process_and_streams_interactive_io(app, tmp_path):
+    import shutil
+    from PySide6.QtCore import QEventLoop, QTimer
+
+    shell = shutil.which("pwsh") or shutil.which("powershell")
+    if not shell:
+        pytest.skip("PowerShell is not installed.")
+    terminal = native_app.InteractiveTerminal()
+    terminal.shell_program = shell
+    terminal.set_directory(tmp_path)
+    terminal.start()
+    worker = terminal.worker
+    assert worker is not None
+    loop = QEventLoop()
+    def send_line(value):
+        terminal.input.setText(value)
+        terminal.send_input()
+
+    QTimer.singleShot(900, lambda: send_line(
+        "$value = Read-Host 'Input'; Write-Output ('got:' + $value); exit 7"))
+    QTimer.singleShot(1800, lambda: send_line("interactive-value"))
+    worker.finished.connect(loop.quit)
+    QTimer.singleShot(12_000, loop.quit)
+    loop.exec()
+    assert not worker.isRunning()
+    assert "got:interactive-value" in terminal.output.toPlainText()
+    assert "code 7" in terminal.output.toPlainText()
+    terminal.shutdown()
+
+
+def test_terminal_bounds_output_marks_stderr_and_has_a_runtime_timeout(app):
+    terminal = native_app.InteractiveTerminal()
+    terminal._append("x" * 1_000_010)
+    assert terminal.output.document().characterCount() <= 1_000_001
+    assert terminal.runtime_timer.interval() == 4 * 60 * 60 * 1000
+    terminal.shutdown()
+
+
+def test_changed_file_system_model_marks_paths(app, tmp_path):
+    model = native_app.ChangedFileSystemModel()
+    target = tmp_path / "changed.py"
+    target.write_text("x", encoding="utf-8")
+    index = model.index(str(target))
+    model.set_changed_paths({str(target): "Modified"})
+    assert "[Modified]" in model.data(index)
+
+
+def test_native_preview_blocks_protected_project_files(app, monkeypatch, tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    secret = project / ".env"
+    secret.write_text("API_KEY=secret-preview-value", encoding="utf-8")
+    monkeypatch.setattr(native_app, "request", lambda method, path, **kwargs: (
+        {"active_project": None, "recent_projects": []} if path == "/api/projects"
+        else {"providers": []} if path == "/api/providers" else {"active_project": str(project)}))
+    window = native_app.LunaWindow(native_app.Backend())
+    window.set_project(str(project))
+    window.preview_path(secret)
+    assert not hasattr(window, "_preview")
+    assert "protected" in window.status.currentMessage().lower()
+    window.backend.stop = lambda: None
+    window.close()

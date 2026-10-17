@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import difflib
+import fnmatch
 import hashlib
 import json
 import os
@@ -86,6 +87,11 @@ class ApprovalInput(BaseModel):
 
 class ResumeInput(BaseModel):
     mode: str = Field(default="read_only", pattern="^(read_only|workspace)$")
+
+
+class ProjectSearchInput(BaseModel):
+    query: str = Field(min_length=1, max_length=200)
+    limit: int = Field(default=100, ge=1, le=200)
 
 
 SECRET_TEXT = re.compile(
@@ -1140,6 +1146,106 @@ class DesktopTypeInput(DesktopTargetInput):
 @app.get("/api/projects")
 def project_status():
     return projects.project_status()
+
+
+def _gitignored(root: Path, relative: str, rules: dict[str, list[str]]) -> bool:
+    parts = Path(relative).parts
+    ignored = False
+    for index in range(1, len(parts) + 1):
+        parent = "/".join(parts[:index])
+        is_dir = index < len(parts) or (root / parent).is_dir()
+        for base, patterns in rules.items():
+            if base and not (parent == base or parent.startswith(base + "/")):
+                continue
+            local = parent[len(base):].lstrip("/") if base else parent
+            for pattern in patterns:
+                negate = pattern.startswith("!")
+                value = pattern[1:] if negate else pattern
+                if not value:
+                    continue
+                anchored = value.startswith("/")
+                directory_only = value.endswith("/")
+                value = value.strip("/")
+                has_slash = "/" in value
+                matched = (fnmatch.fnmatchcase(local, value) if anchored or has_slash
+                           else any(fnmatch.fnmatchcase(part, value) for part in Path(local).parts))
+                if matched and (not directory_only or is_dir):
+                    ignored = not negate
+    return ignored
+
+
+@app.post("/api/projects/search")
+async def search_project(item: ProjectSearchInput, request: Request):
+    return StreamingResponse(_project_search_events(item, request), media_type="application/x-ndjson",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+async def _project_search_events(item: ProjectSearchInput, request: Request):
+    """Stream bounded search results so closing the client cancels the traversal."""
+    root = projects.active_path()
+    rules: dict[str, list[str]] = {"": [".git", ".venv", "venv", "node_modules", "__pycache__", ".luna"]}
+    examined = 0
+    truncated = False
+    found = 0
+    started = time.monotonic()
+    for directory, dirs, files in os.walk(root, followlinks=False):
+        current = Path(directory)
+        rel_dir = current.relative_to(root).as_posix()
+        if ".gitignore" in files and rel_dir != ".":
+            try:
+                lines = (current / ".gitignore").read_text(encoding="utf-8").splitlines()
+                rules[rel_dir] = [line.strip() for line in lines
+                                  if line.strip() and not line.lstrip().startswith("#")]
+            except (OSError, UnicodeError):
+                pass
+        elif ".gitignore" in files:
+            try:
+                lines = (current / ".gitignore").read_text(encoding="utf-8").splitlines()
+                rules[""] = [".git", ".venv", "venv", "node_modules", "__pycache__", ".luna"] + [
+                    line.strip() for line in lines if line.strip() and not line.lstrip().startswith("#")]
+            except (OSError, UnicodeError):
+                pass
+        dirs[:] = [name for name in dirs if not name.startswith(".")
+                   and name not in {"node_modules", "__pycache__", ".venv", "venv"}
+                   and not (current / name).is_symlink()
+                   and not _gitignored(root, (rel_dir + "/" if rel_dir != "." else "") + name, rules)]
+        for filename in files:
+            candidate = current / filename
+            relative = candidate.relative_to(root).as_posix()
+            if filename.startswith(".") or _sensitive_path(root, candidate) or _contains_link(root, relative):
+                continue
+            if _gitignored(root, relative, rules):
+                continue
+            examined += 1
+            if examined > 10_000 or time.monotonic() - started > 15:
+                truncated = True
+                break
+            try:
+                if not candidate.is_file() or candidate.stat().st_size > 500_000:
+                    continue
+                raw = candidate.read_bytes()
+                if b"\x00" in raw[:8192]:
+                    continue
+                content = raw.decode("utf-8")
+            except (OSError, UnicodeError):
+                continue
+            for number, line in enumerate(content.splitlines(), 1):
+                if item.query.casefold() in line.casefold() and not SECRET_TEXT.search(line):
+                    found += 1
+                    yield json.dumps({"match": {"path": relative, "line": number, "text": line[:500]}}) + "\n"
+                    if found >= item.limit:
+                        truncated = True
+                        break
+            if examined % 16 == 0:
+                yield json.dumps({"progress": examined}) + "\n"
+            if truncated:
+                break
+        if truncated:
+            break
+        if await request.is_disconnected():
+            return
+        await asyncio.sleep(0)
+    yield json.dumps({"done": True, "examined": examined, "truncated": truncated}) + "\n"
 
 
 @app.post("/api/projects/open")

@@ -333,6 +333,73 @@ def test_project_rejects_missing_folder(tmp_path, monkeypatch):
     assert response.status_code == 422
 
 
+def test_project_content_search_is_bounded_scoped_and_respects_ignores(tmp_path, monkeypatch):
+    isolate(tmp_path, monkeypatch)
+    project = tmp_path / "search-project"
+    project.mkdir()
+    (project / "src").mkdir()
+    (project / "src" / "main.py").write_text("first needle\nsecond line\n", encoding="utf-8")
+    (project / "generated").mkdir()
+    (project / "generated" / "output.txt").write_text("needle ignored", encoding="utf-8")
+    (project / ".gitignore").write_text("generated/\n", encoding="utf-8")
+    (project / ".hidden.txt").write_text("needle hidden", encoding="utf-8")
+    (project / ".env").write_text("needle secret", encoding="utf-8")
+    (project / "binary.bin").write_bytes(b"needle\x00binary")
+    (project / "too-large.txt").write_text("needle" * 100_000, encoding="utf-8")
+    external = tmp_path / "outside.txt"
+    external.write_text("needle outside", encoding="utf-8")
+    try:
+        (project / "link.txt").symlink_to(external)
+    except OSError:
+        pass
+    client = TestClient(main.app)
+    assert client.post("/api/projects/open", json={"path": str(project)}).status_code == 200
+    response = client.post("/api/projects/search", json={"query": "needle"})
+    assert response.status_code == 200
+    rows = [__import__("json").loads(line) for line in response.iter_lines() if line]
+    matches = [row["match"] for row in rows if "match" in row]
+    assert matches == [{"path": "src/main.py", "line": 1, "text": "first needle"}]
+    assert rows[-1]["done"] is True
+    assert rows[-1]["examined"] >= 1
+
+
+def test_project_content_search_limits_result_count(tmp_path, monkeypatch):
+    isolate(tmp_path, monkeypatch)
+    project = tmp_path / "search-limit"
+    project.mkdir()
+    (project / "many.txt").write_text("needle\n" * 5, encoding="utf-8")
+    client = TestClient(main.app)
+    client.post("/api/projects/open", json={"path": str(project)})
+    response = client.post("/api/projects/search", json={"query": "needle", "limit": 2})
+    rows = [__import__("json").loads(line) for line in response.iter_lines() if line]
+    assert sum("match" in row for row in rows) == 2
+    assert rows[-1]["truncated"] is True
+
+
+def test_project_content_search_stops_when_client_disconnects(tmp_path, monkeypatch):
+    isolate(tmp_path, monkeypatch)
+    project = tmp_path / "search-cancel"
+    project.mkdir()
+    (project / "first.txt").write_text("needle\n", encoding="utf-8")
+    (project / "next").mkdir()
+    (project / "next" / "later.txt").write_text("needle later", encoding="utf-8")
+    projects.open_project(str(project))
+
+    async def disconnected():
+        return {"type": "http.disconnect"}
+
+    request = main.Request({"type": "http", "method": "POST", "path": "/api/projects/search",
+                            "headers": [], "query_string": b""}, receive=disconnected)
+
+    async def collect():
+        return [line async for line in main._project_search_events(
+            main.ProjectSearchInput(query="needle"), request)]
+
+    events = asyncio.run(collect())
+    assert len(events) == 1
+    assert '"path": "first.txt"' in events[0]
+
+
 def test_project_summary_reports_framework_without_returning_script_body(tmp_path):
     project = tmp_path / "react-app"
     project.mkdir()

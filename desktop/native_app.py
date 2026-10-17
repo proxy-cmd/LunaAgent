@@ -3,14 +3,17 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
+import re
 
 import httpx
-from PySide6.QtCore import QDir, QLockFile, QSettings, QSortFilterProxyModel, QThread, Qt, Signal
-from PySide6.QtGui import QAction, QFont
+from PySide6.QtCore import QDir, QLockFile, QSettings, QSortFilterProxyModel, QThread, QTimer, Qt, Signal
+from PySide6.QtGui import QAction, QFont, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFileSystemModel,
     QCheckBox, QDoubleSpinBox, QFormLayout, QHBoxLayout, QLabel, QLineEdit,
@@ -18,6 +21,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit, QPushButton, QSplitter, QStatusBar,
     QSpinBox, QTreeView, QVBoxLayout, QWidget, QDockWidget, QInputDialog, QTabWidget,
 )
+from backend import providers
 
 BASE_URL = "http://127.0.0.1:8765"
 ROOT = Path(__file__).resolve().parents[1]
@@ -34,15 +38,21 @@ class Backend:
                 return
         except httpx.HTTPError:
             pass
-        log_dir = ROOT / ".luna"
+        log_dir = providers.DATA_DIR
         log_dir.mkdir(parents=True, exist_ok=True)
         log = (log_dir / "desktop-backend.log").open("ab")
         flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-        self.process = subprocess.Popen(
-            [sys.executable, "-m", "uvicorn", "backend.main:app", "--host",
-             "127.0.0.1", "--port", "8765"], cwd=ROOT, stdout=log,
-            stderr=subprocess.STDOUT, creationflags=flags,
-        )
+        if getattr(sys, "frozen", False):
+            backend_exe = Path(sys.executable).with_name("LunaBackend.exe")
+            if not backend_exe.is_file():
+                raise RuntimeError("LunaBackend.exe is missing. Rebuild the packaged application.")
+            command, cwd = [str(backend_exe)], str(backend_exe.parent)
+        else:
+            command = [sys.executable, "-m", "uvicorn", "backend.main:app", "--host",
+                       "127.0.0.1", "--port", "8765"]
+            cwd = str(ROOT)
+        self.process = subprocess.Popen(command, cwd=cwd, stdout=log,
+                                        stderr=subprocess.STDOUT, creationflags=flags)
         for _ in range(80):
             if self.process.poll() is not None:
                 raise RuntimeError("Luna backend stopped during startup. See .luna/desktop-backend.log.")
@@ -91,20 +101,21 @@ class TaskWorker(QThread):
     finished_task = Signal(dict)
     failed = Signal(str)
 
-    def __init__(self, message: str, mode: str, workspace: str):
+    def __init__(self, message: str, mode: str, workspace: str, task_id: int | None = None):
         super().__init__()
         self.message = message
         self.mode = mode
         self.workspace = workspace
-        self.task_id: int | None = None
+        self.task_id: int | None = task_id
 
     def run(self):
+        exit_code = -1
         try:
-            started = request("POST", "/api/tasks", json={"message": self.message,
-                                                              "mode": self.mode,
-                                                              "workspace": self.workspace})
-            self.task_id = started["id"]
-            cursor = 0
+            if self.task_id is None:
+                started = request("POST", "/api/tasks", json={"message": self.message,
+                                                                  "mode": self.mode,
+                                                                  "workspace": self.workspace})
+                self.task_id = started["id"]
             # The existing SSE endpoint replays persisted events and closes when the task ends.
             with httpx.stream("GET", f"{BASE_URL}/api/tasks/{self.task_id}/events", timeout=None) as response:
                 response.raise_for_status()
@@ -147,6 +158,203 @@ class TaskComposer(QPlainTextEdit):
         super().keyPressEvent(event)
 
 
+class TerminalWorker(QThread):
+    output = Signal(str)
+    terminal_started = Signal()
+    failed = Signal(str)
+    exited = Signal(int)
+
+    ANSI = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
+    ENVIRONMENT = {"PATH", "PATHEXT", "SYSTEMROOT", "WINDIR", "TEMP", "TMP",
+                   "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "COMSPEC", "APPDATA",
+                   "LOCALAPPDATA", "PROGRAMFILES", "PROGRAMFILES(X86)", "PSMODULEPATH"}
+
+    def __init__(self, program: str, directory: str, parent=None):
+        super().__init__(parent)
+        self.program = program
+        self.directory = directory
+        self.process = None
+        self._closing = threading.Event()
+
+    def run(self):
+        try:
+            from winpty import PtyProcess
+            if self._closing.is_set():
+                return
+            env = {key: value for key, value in os.environ.items()
+                   if key.upper() in self.ENVIRONMENT}
+            self.process = PtyProcess.spawn([self.program, "-NoLogo", "-NoProfile"],
+                                            cwd=self.directory, env=env, dimensions=(32, 120))
+            if self._closing.is_set():
+                return
+            self.terminal_started.emit()
+            while not self._closing.is_set():
+                try:
+                    output = self.process.read(4096)
+                except EOFError:
+                    break
+                output = self.ANSI.sub("", output).replace("\r\n", "\n").replace("\r", "\n")
+                output = "".join(char for char in output if char in "\n\t" or ord(char) >= 32)
+                if output:
+                    self.output.emit(output)
+            code = self.process.exitstatus
+            exit_code = int(code) if code is not None else -1
+        except Exception as exc:
+            if not self._closing.is_set():
+                self.failed.emit(f"Could not start or read the Windows ConPTY terminal: {exc}")
+        finally:
+            if self.process is not None:
+                try:
+                    self.process.close(force=True)
+                except Exception:
+                    pass
+                code = self.process.exitstatus
+                if code is not None:
+                    exit_code = int(code)
+            self.exited.emit(exit_code)
+
+    def write(self, text: str):
+        process = self.process
+        if process is not None and not self._closing.is_set():
+            try:
+                process.write(text)
+            except (EOFError, OSError):
+                pass
+
+    def terminate(self):
+        if self._closing.is_set():
+            return
+        self._closing.set()
+        process = self.process
+        if process is not None:
+            # Closing the ConPTY stops only the process spawned by this worker.
+            threading.Thread(target=lambda: self._close_process(process), daemon=True).start()
+
+    @staticmethod
+    def _close_process(process):
+        try:
+            process.close(force=True)
+        except Exception:
+            pass
+
+
+class InteractiveTerminal(QWidget):
+    """Persistent Windows ConPTY terminal; starts only on explicit user action."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.shell_program: str | None = None
+        self.worker: TerminalWorker | None = None
+        self.runtime_timer = QTimer(self)
+        self.runtime_timer.setSingleShot(True)
+        self.runtime_timer.setInterval(4 * 60 * 60 * 1000)
+        self.runtime_timer.timeout.connect(self.terminate)
+        self._output_char_count = 0
+        self.output = QPlainTextEdit()
+        self.output.setReadOnly(True)
+        self.output.setMaximumBlockCount(3000)
+        self.output.setFont(QFont("Cascadia Code", 10))
+        self.cwd = QLineEdit()
+        self.cwd.setPlaceholderText("Working directory")
+        self.cwd.setReadOnly(True)
+        self.browse_button = QPushButton("Choose folder")
+        self.start_button = QPushButton("Start PowerShell")
+        self.stop_button = QPushButton("Terminate")
+        self.stop_button.setEnabled(False)
+        self.input = QLineEdit()
+        self.input.setPlaceholderText("Start the shell, then enter a command or redirected-stdin input")
+        self.input.setEnabled(False)
+        top = QHBoxLayout()
+        top.addWidget(self.cwd, 1)
+        top.addWidget(self.browse_button)
+        top.addWidget(self.start_button)
+        top.addWidget(self.stop_button)
+        layout = QVBoxLayout(self)
+        layout.addLayout(top)
+        layout.addWidget(self.output, 1)
+        layout.addWidget(self.input)
+        self.start_button.clicked.connect(self.start)
+        self.browse_button.clicked.connect(self.choose_directory)
+        self.stop_button.clicked.connect(self.terminate)
+        self.input.returnPressed.connect(self.send_input)
+
+    def set_directory(self, path: str | Path | None):
+        self.cwd.setText(str(path or ""))
+
+    def choose_directory(self):
+        directory = QFileDialog.getExistingDirectory(self, "Terminal working directory", self.cwd.text() or str(Path.home()))
+        if directory:
+            self.set_directory(directory)
+
+    def start(self):
+        if self.worker and self.worker.isRunning():
+            return
+        directory = self.cwd.text()
+        if not directory or not Path(directory).is_dir():
+            self._append("Open a project before starting the terminal.\n")
+            return
+        program = self.shell_program or shutil.which("pwsh") or shutil.which("powershell") or "powershell.exe"
+        self.output.appendPlainText(f"Starting {program} in {directory}\nConPTY combines stdout and stderr. Manual commands use your Windows account permissions; they are not OS-sandboxed.\n")
+        self.worker = TerminalWorker(program, directory, self)
+        self.worker.output.connect(self._append)
+        self.worker.terminal_started.connect(self._started)
+        self.worker.failed.connect(self._append_error)
+        self.worker.exited.connect(self._finished)
+        self.worker.start()
+
+    def _started(self):
+        self.start_button.setEnabled(False)
+        self.stop_button.setEnabled(True)
+        self.input.setEnabled(True)
+        self.runtime_timer.start()
+        self.input.setFocus()
+        self._append("[shell started]\n")
+
+    def send_input(self):
+        if not self.worker or not self.worker.isRunning():
+            return
+        command = self.input.text()
+        self.input.clear()
+        self._append(f"> {command}\n")
+        self.worker.write(command + "\r")
+
+    def terminate(self):
+        if not self.worker or not self.worker.isRunning():
+            return
+        self.worker.terminate()
+        self._append("[termination requested for Luna's terminal process]\n")
+
+    def _finished(self, code):
+        self.runtime_timer.stop()
+        self._append(f"[shell exited: code {code}]\n")
+        self.start_button.setEnabled(True)
+        self.stop_button.setEnabled(False)
+        self.input.setEnabled(False)
+
+    def _append_error(self, error: str):
+        self._append("[terminal error] " + error + "\n")
+        self.start_button.setEnabled(True)
+        self.stop_button.setEnabled(False)
+        self.input.setEnabled(False)
+
+    def _append(self, text: str):
+        if text:
+            cursor = self.output.textCursor()
+            cursor.movePosition(cursor.MoveOperation.End)
+            cursor.insertText(text)
+            excess = self.output.document().characterCount() - 1 - 1_000_000
+            if excess > 0:
+                cursor.movePosition(cursor.MoveOperation.Start)
+                cursor.movePosition(cursor.MoveOperation.Right, cursor.MoveMode.KeepAnchor, excess)
+                cursor.removeSelectedText()
+            self.output.setTextCursor(cursor)
+
+    def shutdown(self):
+        self.runtime_timer.stop()
+        if self.worker and self.worker.isRunning():
+            self.worker.terminate()
+            self.worker.wait(5000)
+
+
 class ApiWorker(QThread):
     completed = Signal(object)
     failed = Signal(str)
@@ -167,6 +375,125 @@ class ApiWorker(QThread):
             self.failed.emit(str(exc))
 
 
+class SearchWorker(QThread):
+    match = Signal(dict)
+    progress = Signal(int)
+    completed = Signal(dict)
+    failed = Signal(str)
+
+    def __init__(self, query: str, limit: int = 100, parent=None):
+        super().__init__(parent)
+        self.query = query
+        self.limit = limit
+
+    def run(self):
+        try:
+            with httpx.stream("POST", BASE_URL + "/api/projects/search",
+                              json={"query": self.query, "limit": self.limit},
+                              timeout=httpx.Timeout(connect=10, read=5, write=10, pool=10)) as response:
+                response.raise_for_status()
+                final = {}
+                for line in response.iter_lines():
+                    if self.isInterruptionRequested():
+                        return
+                    if not line:
+                        continue
+                    item = json.loads(line)
+                    if "match" in item:
+                        self.match.emit(item["match"])
+                    elif "progress" in item:
+                        self.progress.emit(item["progress"])
+                    elif item.get("done"):
+                        final = item
+                if final:
+                    self.completed.emit(final)
+        except Exception as exc:
+            if not self.isInterruptionRequested():
+                self.failed.emit(str(exc))
+
+
+class SearchDialog(QDialog):
+    def __init__(self, query: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Search project contents")
+        self.resize(850, 580)
+        self.results = QListWidget()
+        self.status = QLabel("Searching the active project…")
+        self.cancel = QPushButton("Cancel search")
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.status)
+        layout.addWidget(self.results, 1)
+        layout.addWidget(self.cancel)
+        self.worker = SearchWorker(query, parent=self)
+        self.worker.match.connect(self.add_match)
+        self.worker.progress.connect(lambda count: self.status.setText(f"Checked {count} files…"))
+        self.worker.completed.connect(self.search_done)
+        self.worker.failed.connect(self.search_failed)
+        self.cancel.clicked.connect(self.stop_search)
+        self.worker.start()
+
+    def add_match(self, match: dict):
+        row = QListWidgetItem(f"{match['path']}:{match['line']}  {match['text']}")
+        row.setData(Qt.UserRole, match)
+        self.results.addItem(row)
+
+    def search_done(self, info: dict):
+        suffix = " Results capped; refine the query." if info.get("truncated") else ""
+        self.status.setText(f"Search complete. Checked {info.get('examined', 0)} files.{suffix}")
+        self.cancel.setText("Close")
+        self.cancel.clicked.disconnect()
+        self.cancel.clicked.connect(self.accept)
+
+    def search_failed(self, error: str):
+        self.status.setText("Search failed: " + error)
+        self.cancel.setText("Close")
+        self.cancel.clicked.disconnect()
+        self.cancel.clicked.connect(self.accept)
+
+    def stop_search(self):
+        self.worker.requestInterruption()
+        self.status.setText("Cancelling search…")
+        self.cancel.setEnabled(False)
+
+    def closeEvent(self, event):
+        if self.worker.isRunning():
+            self.worker.requestInterruption()
+            self.worker.wait(1200)
+        event.accept()
+
+
+class ChangedFileSystemModel(QFileSystemModel):
+    """Decorate files changed by the most recently reviewed task."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.changed_paths: dict[str, str] = {}
+
+    def set_changed_paths(self, changed: dict[str, str]):
+        self.changed_paths = {os.path.normcase(os.path.abspath(path)): label
+                              for path, label in changed.items()}
+
+    def data(self, index, role=Qt.DisplayRole):
+        value = super().data(index, role)
+        if role == Qt.DisplayRole and index.isValid() and index.column() == 0:
+            label = self.changed_paths.get(os.path.normcase(os.path.abspath(self.filePath(index))))
+            if label:
+                return f"{value}  [{label}]"
+        return value
+
+
+def _protected_preview_path(path: Path, root: Path) -> bool:
+    try:
+        relative = path.resolve().relative_to(root.resolve())
+    except (OSError, RuntimeError, ValueError):
+        return True
+    parts = {part.casefold() for part in relative.parts}
+    name = path.name.casefold()
+    return (".git" in parts or ".luna" in parts or name == ".env"
+            or name.startswith(".env.")
+            or name in {"id_rsa", "id_ed25519", ".npmrc", ".pypirc"}
+            or path.suffix.casefold() in {".pem", ".p12", ".pfx", ".key"})
+
+
 class LunaWindow(QMainWindow):
     def __init__(self, backend: Backend):
         super().__init__()
@@ -175,6 +502,7 @@ class LunaWindow(QMainWindow):
         self.worker: TaskWorker | None = None
         self.active_task: int | None = None
         self.project: Path | None = None
+        self.last_task_id: int | None = None
         self.setWindowTitle("Luna Desk")
         self.resize(1420, 900)
         self.setMinimumSize(900, 620)
@@ -230,7 +558,7 @@ class LunaWindow(QMainWindow):
 
         split = QSplitter(Qt.Horizontal)
         self.files = QTreeView()
-        self.fs_model = QFileSystemModel(self)
+        self.fs_model = ChangedFileSystemModel(self)
         self.fs_model.setReadOnly(True)
         self.fs_model.setResolveSymlinks(False)
         self.fs_model.setFilter(QDir.Dirs | QDir.Files | QDir.NoDotAndDotDot)
@@ -249,6 +577,10 @@ class LunaWindow(QMainWindow):
         self.file_search.setPlaceholderText("Filter visible file names…")
         self.file_search.textChanged.connect(self.filter_tree)
         left_layout.addWidget(self.file_search)
+        self.content_search = QLineEdit()
+        self.content_search.setPlaceholderText("Search file contents…")
+        self.content_search.returnPressed.connect(self.search_contents)
+        left_layout.addWidget(self.content_search)
         left_layout.addWidget(self.files)
         self.recent = QComboBox()
         self.recent.currentIndexChanged.connect(self.open_recent)
@@ -292,12 +624,14 @@ class LunaWindow(QMainWindow):
         dock = QDockWidget("Tool activity · task events", self)
         dock.setWidget(self.activity)
         self.addDockWidget(Qt.BottomDockWidgetArea, dock)
-        self.terminal = QPlainTextEdit()
-        self.terminal.setReadOnly(True)
-        self.terminal.setMaximumBlockCount(3000)
-        terminal_dock = QDockWidget("Command output", self)
+        self.terminal = InteractiveTerminal(self)
+        terminal_dock = QDockWidget("Manual PowerShell · current-user permissions", self)
         terminal_dock.setWidget(self.terminal)
         self.addDockWidget(Qt.BottomDockWidgetArea, terminal_dock)
+        self.changes_list = QListWidget()
+        changes_dock = QDockWidget("Latest task changes", self)
+        changes_dock.setWidget(self.changes_list)
+        self.addDockWidget(Qt.BottomDockWidgetArea, changes_dock)
         self.status = QStatusBar()
         self.setStatusBar(self.status)
         self.status.showMessage("Local Luna agent ready")
@@ -315,6 +649,9 @@ class LunaWindow(QMainWindow):
         try:
             info = request("POST", "/api/projects/open", json={"path": path})
             self.project = Path(info["active_project"])
+            self.terminal.set_directory(self.project)
+            self.fs_model.set_changed_paths({})
+            self.changes_list.clear()
             self.project_label.setText(self.project.name)
             self.project_label.setToolTip(str(self.project))
             self.project_path.setText(str(self.project))
@@ -378,8 +715,70 @@ class LunaWindow(QMainWindow):
         if not ok:
             return
         selected = items[labels.index(label)]
-        self.transcript.appendPlainText(f"\nHistory · {selected['status']}\n{selected.get('answer') or selected.get('error') or selected['message']}\n")
-        self.review_changes(selected["id"])
+        try:
+            state = request("GET", f"/api/tasks/{selected['id']}")
+        except Exception as exc:
+            QMessageBox.warning(self, "Task history", str(exc))
+            return
+        events = state.get("events", [])
+        event_text = "\n".join(f"{event['created']} [{event['kind']}] {event['detail']}" for event in events)
+        try:
+            used_skills = request("GET", f"/api/tasks/{selected['id']}/skills").get("skills", [])
+        except Exception:
+            used_skills = []
+        reason = "Safe to resume: no tool had started before interruption." if state.get("can_resume") else "This task cannot be replayed safely." if state.get("status") == "interrupted" else "Resume is available only for interrupted tasks."
+        details = f"{state.get('answer') or state.get('error') or state['message']}\n\n{reason}\nSkills used: {', '.join(used_skills) or '(none recorded)'}\n\nRecorded events:\n{event_text or '(none)'}"
+        box = QMessageBox(self)
+        box.setWindowTitle(f"Task #{selected['id']} · {selected['status']}")
+        box.setText(f"{selected['message']}\n\n{reason}")
+        box.setDetailedText(details)
+        review = box.addButton("Review changes", QMessageBox.ActionRole)
+        resume = box.addButton("Resume safely", QMessageBox.AcceptRole)
+        new_task = box.addButton("New task from context", QMessageBox.ActionRole)
+        close = box.addButton(QMessageBox.Close)
+        resume.setEnabled(bool(state.get("can_resume")))
+        box.setDefaultButton(close)
+        box.exec()
+        clicked = box.clickedButton()
+        self.transcript.appendPlainText(f"\nHistory · {selected['status']}\n{details}\n")
+        if clicked is review:
+            self.last_task_id = selected["id"]
+            self.review_changes(selected["id"])
+            self.refresh_changes(selected["id"])
+        elif clicked is resume:
+            self.resume_saved_task(state)
+        elif clicked is new_task:
+            self.composer.setPlainText(
+                f"Continue from task #{selected['id']} using this recorded context.\n"
+                f"Original request: {selected['message']}\n"
+                f"Recorded response: {selected.get('answer') or selected.get('error') or '(none)'}\n\n"
+                "New request: ")
+            self.composer.setFocus()
+        return
+
+    def resume_saved_task(self, state: dict):
+        if not state.get("can_resume"):
+            return
+        if not self.project or Path(state.get("workspace", "")).resolve() != self.project.resolve():
+            QMessageBox.information(self, "Open the original project", "Resume is allowed only after reopening the project that owns this task.")
+            return
+        mode, ok = QInputDialog.getItem(self, "Resume task", "Choose permissions for this retry:",
+                                        ["Restricted · read only", "Workspace · edits and approved actions"], 0, False)
+        if not ok:
+            return
+        permission = "workspace" if mode.startswith("Workspace") else "read_only"
+        confirm = QMessageBox.question(self, "Resume from the beginning",
+            "This task had not started a tool, so Luna can safely retry it. The original request will run again with the selected permission mode. Continue?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if confirm != QMessageBox.Yes:
+            return
+        self.mode.setCurrentIndex(max(0, self.mode.findData(permission)))
+        try:
+            request("POST", f"/api/tasks/{state['id']}/resume", json={"mode": permission})
+        except Exception as exc:
+            QMessageBox.warning(self, "Could not resume task", str(exc))
+            return
+        self._start_task_worker(state["message"], permission, state["workspace"], state["id"])
 
     def review_changes(self, task_id: int):
         try:
@@ -423,22 +822,81 @@ class LunaWindow(QMainWindow):
         layout.addWidget(restore)
         show_change(0)
         dialog.exec()
+        if self.project:
+            self.refresh_changes(task_id)
+
+    def refresh_changes(self, task_id: int):
+        try:
+            state = request("GET", f"/api/tasks/{task_id}")
+            changes = request("GET", f"/api/tasks/{task_id}/changes").get("changes", [])
+        except Exception as exc:
+            self.status.showMessage(f"Could not refresh task changes: {exc}", 7000)
+            return
+        if not self.project or Path(state.get("workspace", "")).resolve() != self.project.resolve():
+            return
+        self.last_task_id = task_id
+        marked = {}
+        self.changes_list.clear()
+        for change in changes:
+            operation = change.get("operation", "write")
+            if change.get("status") == "restored":
+                label = "Restored"
+            elif operation == "delete":
+                label = "Deleted"
+            elif operation == "move":
+                label = "Moved"
+            elif change.get("before_hash") is None:
+                label = "Added"
+            else:
+                label = "Modified"
+            if change.get("status") != "restored":
+                marked[str(self.project / change["path"])] = label
+            if operation == "move" and change.get("destination"):
+                marked[str(self.project / change["destination"])] = "Moved here"
+            target = change.get("destination") if operation == "move" else change["path"]
+            self.changes_list.addItem(f"{target} · {label} · task #{task_id}")
+        self.fs_model.set_changed_paths(marked)
+        self.files.viewport().update()
 
     def filter_tree(self, value: str):
         self.fs_proxy.setFilterFixedString(value)
 
+    def search_contents(self):
+        query = self.content_search.text().strip()
+        if not self.project:
+            QMessageBox.information(self, "Open a project", "Content search is limited to the active project.")
+            return
+        if not query:
+            return
+        dialog = SearchDialog(query, self)
+        dialog.results.itemDoubleClicked.connect(
+            lambda row: self.preview_path(self.project / row.data(Qt.UserRole)["path"]))
+        dialog.exec()
+
     def preview_file(self, index):
         source_index = self.fs_proxy.mapToSource(index)
         path = Path(self.fs_model.filePath(source_index))
-        if not path.is_file() or path.stat().st_size > 1_000_000:
+        self.preview_path(path)
+
+    def preview_path(self, path: Path):
+        if not self.project or _protected_preview_path(path, self.project):
+            self.status.showMessage("Credential files and repository metadata are protected from preview.", 5000)
             return
         try:
-            text = path.read_text(encoding="utf-8")
+            resolved = path.resolve(strict=True)
+            resolved.relative_to(self.project.resolve())
+        except (OSError, ValueError, RuntimeError):
+            self.status.showMessage("Preview is limited to files inside the active project.", 5000)
+            return
+        if path.is_symlink() or not resolved.is_file() or resolved.stat().st_size > 1_000_000:
+            return
+        try:
+            text = resolved.read_text(encoding="utf-8")
         except (OSError, UnicodeError):
             self.status.showMessage("This file is not readable UTF-8 text.", 5000)
             return
         preview = QMainWindow(self)
-        preview.setWindowTitle(str(path))
+        preview.setWindowTitle(str(resolved))
         preview.resize(800, 600)
         view = QPlainTextEdit(preview)
         view.setReadOnly(True)
@@ -455,11 +913,16 @@ class LunaWindow(QMainWindow):
             return
         if not message:
             return
+        self._start_task_worker(message, self.mode.currentData(), str(self.project))
+
+    def _start_task_worker(self, message: str, mode: str, workspace: str, task_id: int | None = None):
+        if self.worker and self.worker.isRunning():
+            return
         self.transcript.appendPlainText(f"\nYou\n{message}\n\nLuna\n")
         self.composer.clear()
         self.run_button.setEnabled(False)
         self.stop_button.setEnabled(True)
-        self.worker = TaskWorker(message, self.mode.currentData(), str(self.project))
+        self.worker = TaskWorker(message, mode, workspace, task_id)
         self.worker.event.connect(self.on_event)
         self.worker.approval_requested.connect(self.confirm_approval)
         self.worker.finished_task.connect(self.on_finished)
@@ -476,7 +939,7 @@ class LunaWindow(QMainWindow):
         else:
             self.activity.appendPlainText(f"[{kind}] {detail}")
             if kind == "command":
-                self.terminal.appendPlainText(detail)
+                self.terminal.output.appendPlainText("[agent command result] " + detail)
             if kind in ("tool", "command", "approval", "error", "status"):
                 self.transcript.appendPlainText(f"[{kind}] {detail}")
 
@@ -505,6 +968,7 @@ class LunaWindow(QMainWindow):
         self.status.showMessage(f"Task {state.get('status', 'finished')}", 7000)
         if state.get("id"):
             self.review_changes(state["id"])
+            self.refresh_changes(state["id"])
         self._task_done()
 
     def on_failed(self, error: str):
@@ -540,6 +1004,7 @@ class LunaWindow(QMainWindow):
                 event.ignore()
                 return
         self.settings.setValue("window/geometry", self.saveGeometry())
+        self.terminal.shutdown()
         self.backend.stop()
         event.accept()
 
@@ -551,6 +1016,7 @@ class IntegrationsDialog(QDialog):
         self.setWindowTitle("Skills, MCP and automation")
         self.resize(800, 650)
         self.worker = None
+        self.cancel_worker = None
         self.skills = {}
         self.servers = {}
         outer = QVBoxLayout(self)
@@ -586,6 +1052,10 @@ class IntegrationsDialog(QDialog):
         mcp_layout.addLayout(mcp_form)
         self.mcp_list = QListWidget()
         mcp_layout.addWidget(self.mcp_list, 1)
+        self.mcp_details = QPlainTextEdit()
+        self.mcp_details.setReadOnly(True)
+        mcp_layout.addWidget(self.mcp_details, 1)
+        self.mcp_list.itemDoubleClicked.connect(self.inspect_mcp_tools)
         mcp_buttons = QHBoxLayout()
         for label, callback in (("Add server", self.add_mcp), ("Connect / refresh tools", self.connect_mcp), ("Enable / disable tools", self.toggle_mcp), ("Disconnect", self.disconnect_mcp), ("Remove", self.remove_mcp), ("Refresh", self.refresh_mcp)):
             button = QPushButton(label)
@@ -599,19 +1069,68 @@ class IntegrationsDialog(QDialog):
         automation_layout.addWidget(QLabel("Browser automation"))
         self.browser_status = QLabel("")
         automation_layout.addWidget(self.browser_status)
+        self.browser_url = QLineEdit()
+        self.browser_url.setPlaceholderText("https://public-site.example (loopback requires explicit opt-in)")
+        automation_layout.addWidget(self.browser_url)
         browser_buttons = QHBoxLayout()
         self.browser_toggle = QPushButton("Start browser session")
         self.browser_toggle.clicked.connect(self.toggle_browser)
         browser_buttons.addWidget(self.browser_toggle)
+        self.browser_local = QCheckBox("Allow localhost for this session")
+        browser_buttons.addWidget(self.browser_local)
+        for label, callback in (("Navigate", self.browser_navigate), ("Inspect page", self.browser_inspect),
+                                ("Screenshot", self.browser_capture)):
+            button = QPushButton(label)
+            button.clicked.connect(callback)
+            browser_buttons.addWidget(button)
         automation_layout.addLayout(browser_buttons)
+        self.browser_selector = QLineEdit()
+        self.browser_selector.setPlaceholderText("CSS selector for an explicitly approved click or fill")
+        self.browser_value = QLineEdit()
+        self.browser_value.setPlaceholderText("Non-secret text to fill (blank to click)")
+        automation_layout.addWidget(self.browser_selector)
+        automation_layout.addWidget(self.browser_value)
+        browser_actions = QHBoxLayout()
+        for label, callback in (("Inspect page text", self.browser_inspect), ("Click / fill with approval", self.browser_act),
+                                ("Cancel / close session", self.close_browser)):
+            button = QPushButton(label)
+            button.clicked.connect(callback)
+            browser_actions.addWidget(button)
+        automation_layout.addLayout(browser_actions)
+        self.browser_page = QPlainTextEdit()
+        self.browser_page.setReadOnly(True)
+        self.browser_page.setMaximumHeight(140)
+        automation_layout.addWidget(self.browser_page)
         automation_layout.addWidget(QLabel("Windows UI Automation"))
         self.desktop_status = QLabel("")
         automation_layout.addWidget(self.desktop_status)
-        desktop_buttons = QHBoxLayout()
+        self.desktop_windows = QComboBox()
+        automation_layout.addWidget(self.desktop_windows)
+        desktop_controls = QHBoxLayout()
+        for label, callback in (("Refresh windows", self.refresh_windows), ("Select window", self.select_window),
+                                ("Inspect controls", self.inspect_window), ("Screenshot", self.desktop_capture)):
+            button = QPushButton(label)
+            button.clicked.connect(callback)
+            desktop_controls.addWidget(button)
+        automation_layout.addLayout(desktop_controls)
+        self.desktop_control = QComboBox()
+        self.desktop_text = QLineEdit()
+        self.desktop_text.setPlaceholderText("Optional non-secret text for the selected Edit control")
+        self.desktop_details = QPlainTextEdit()
+        self.desktop_details.setReadOnly(True)
+        self.desktop_details.setMaximumHeight(130)
+        automation_layout.addWidget(self.desktop_control)
+        automation_layout.addWidget(self.desktop_text)
+        desktop_actions = QHBoxLayout()
+        for label, callback in (("Click selected control", self.desktop_click), ("Type into selected control", self.desktop_type)):
+            button = QPushButton(label)
+            button.clicked.connect(callback)
+            desktop_actions.addWidget(button)
         self.desktop_toggle = QPushButton("Enable desktop access")
         self.desktop_toggle.clicked.connect(self.toggle_desktop)
-        desktop_buttons.addWidget(self.desktop_toggle)
-        automation_layout.addLayout(desktop_buttons)
+        desktop_actions.addWidget(self.desktop_toggle)
+        automation_layout.addLayout(desktop_actions)
+        automation_layout.addWidget(self.desktop_details)
         automation_layout.addStretch(1)
         tabs.addTab(automation, "Automation")
         close = QDialogButtonBox(QDialogButtonBox.Close)
@@ -628,6 +1147,7 @@ class IntegrationsDialog(QDialog):
     def _action(self, method, path, payload, button, callback, timeout=10):
         if self.worker and self.worker.isRunning():
             return
+        button = button or self.status
         button.setEnabled(False)
         self.worker = ApiWorker(method, path, payload, timeout, self)
         self.worker.completed.connect(lambda result: (button.setEnabled(True), callback(result)))
@@ -776,19 +1296,148 @@ class IntegrationsDialog(QDialog):
             if state.get("active"):
                 self._action("POST", "/api/browser/close", {}, self.sender(), lambda _: self.refresh_automation())
             else:
-                self._action("POST", "/api/browser/start", {"allow_local": False}, self.sender(), lambda _: self.refresh_automation())
+                self._action("POST", "/api/browser/start", {"allow_local": self.browser_local.isChecked()}, self.sender(), lambda _: self.refresh_automation())
         except Exception as exc:
-            self.status.setText(str(exc))
+            self.browser_status.setText(str(exc))
+
+    def close_browser(self):
+        if self.cancel_worker and self.cancel_worker.isRunning():
+            return
+        self.browser_status.setText("Closing browser session and stopping its current navigation…")
+        self.cancel_worker = ApiWorker("POST", "/api/browser/close", {}, 10, self)
+        self.cancel_worker.completed.connect(lambda _: self.refresh_automation())
+        self.cancel_worker.failed.connect(lambda error: self.browser_status.setText("Could not close browser session: " + error))
+        self.cancel_worker.start()
+
+    def browser_navigate(self):
+        url = self.browser_url.text().strip()
+        if not url:
+            self.status.setText("Enter a public HTTPS URL. Loopback requires the explicit session option.")
+            return
+        self._action("POST", "/api/browser/navigate", {"url": url}, self.sender(),
+                     lambda result: self.browser_page.setPlainText(json.dumps(result, indent=2)), timeout=25)
+
+    def browser_inspect(self):
+        self._action("GET", "/api/browser/page", None, self.sender(),
+                     lambda result: self.browser_page.setPlainText(
+                         f"{result.get('title', '')}\n\n{result.get('text', '')}" +
+                         ("\n[page text truncated]" if result.get("truncated") else "")), timeout=12)
+
+    def browser_act(self):
+        selector = self.browser_selector.text().strip()
+        if not selector:
+            self.status.setText("Enter a selector before choosing a browser action.")
+            return
+        value = self.browser_value.text()
+        label = f"Fill selector {selector!r} with {value!r}" if value else f"Click selector {selector!r}"
+        if QMessageBox.question(self, "Approve browser action", f"{label}? Page content is untrusted.",
+                                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+            return
+        path = "/api/browser/fill" if value else "/api/browser/click"
+        payload = {"selector": selector, "value": value} if value else {"selector": selector}
+        self._action("POST", path, payload, self.sender(),
+                     lambda result: self.browser_page.setPlainText(json.dumps(result, indent=2)), timeout=15)
+
+    def browser_capture(self):
+        self._action("POST", "/api/browser/screenshot", {}, self.sender(),
+                     lambda result: self.show_screenshot("/api/browser/screenshots/" + result["name"], "Browser screenshot"), timeout=15)
+
+    def show_screenshot(self, path: str, title: str):
+        try:
+            response = httpx.get(BASE_URL + path, timeout=15)
+            response.raise_for_status()
+            pixmap = QPixmap()
+            if not pixmap.loadFromData(response.content):
+                raise RuntimeError("Screenshot data could not be decoded.")
+            dialog = QDialog(self)
+            dialog.setWindowTitle(title)
+            dialog.resize(900, 650)
+            layout = QVBoxLayout(dialog)
+            view = QLabel()
+            view.setPixmap(pixmap.scaled(860, 560, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            layout.addWidget(view, 1)
+            dialog.exec()
+        except Exception as exc:
+            self.status.setText("Screenshot error: " + str(exc))
 
     def toggle_desktop(self):
         try:
             state = request("GET", "/api/desktop/status")
             self._action("PUT", "/api/desktop/enabled", {"enabled": not state.get("enabled")}, self.sender(), lambda _: self.refresh_automation())
         except Exception as exc:
-            self.status.setText(str(exc))
+            self.desktop_status.setText(str(exc))
+
+    def refresh_windows(self):
+        self._action("GET", "/api/desktop/windows", None, self.sender(), self._show_windows, timeout=15)
+
+    def _show_windows(self, result):
+        self.desktop_windows.clear()
+        for item in result.get("windows", []):
+            self.desktop_windows.addItem(item["title"], item["handle"])
+        if not self.desktop_windows.count():
+            self.desktop_status.setText("No accessible titled windows were found.")
+
+    def select_window(self):
+        handle = self.desktop_windows.currentData()
+        if not handle:
+            return
+        self._action("POST", "/api/desktop/select", {"handle": handle}, self.sender(),
+                     lambda result: (self.desktop_status.setText("Selected: " + result.get("title", "")), self.inspect_window()), timeout=15)
+
+    def inspect_window(self):
+        handle = self.desktop_windows.currentData()
+        if not handle:
+            return
+        self._action("GET", f"/api/desktop/windows/{handle}", None, self.sender(), self._show_controls, timeout=15)
+
+    def _show_controls(self, result):
+        self.desktop_control.clear()
+        for item in result.get("controls", []):
+            label = f"{item['index']}: {item['type']} {item.get('name') or item.get('automation_id') or '(unnamed)'} · {'enabled' if item.get('enabled') else 'disabled'}"
+            self.desktop_control.addItem(label, item["index"])
+        self.desktop_details.setPlainText(json.dumps(result, indent=2))
+
+    def desktop_capture(self):
+        handle = self.desktop_windows.currentData()
+        if not handle:
+            return
+        self._action("POST", "/api/desktop/screenshot", {"handle": handle}, self.sender(),
+                     lambda result: self.show_screenshot("/api/desktop/screenshots/" + result["name"], "Desktop screenshot"), timeout=15)
+
+    def _desktop_action(self, action: str):
+        handle, index = self.desktop_windows.currentData(), self.desktop_control.currentData()
+        if handle is None or index is None:
+            return
+        text = self.desktop_text.text() if action == "type" else ""
+        label = f"{action.title()} control {self.desktop_control.currentText()}"
+        if text:
+            label += f" with text {text!r}"
+        if QMessageBox.question(self, "Approve Windows interaction", label + "? This interacts with the selected application as your current user.",
+                                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+            return
+        payload = {"handle": handle, "index": index}
+        if action == "type":
+            payload["text"] = text
+        path = "/api/desktop/type" if action == "type" else "/api/desktop/click"
+        self._action("POST", path, payload, self.sender(), lambda result: self.desktop_status.setText(json.dumps(result)))
+
+    def desktop_click(self):
+        self._desktop_action("click")
+
+    def desktop_type(self):
+        self._desktop_action("type")
+
+    def inspect_mcp_tools(self, _item=None):
+        server_id = self._selected_id(self.mcp_list)
+        if not server_id:
+            return
+        server = self.servers.get(server_id, {})
+        self.mcp_details.setPlainText(json.dumps({"server": server.get("name"), "connection_error": server.get("last_error"),
+                                                 "tools_and_schemas": server.get("tools", [])}, indent=2)[:12000])
 
     def closeEvent(self, event):
-        if self.worker and self.worker.isRunning():
+        if ((self.worker and self.worker.isRunning())
+                or (self.cancel_worker and self.cancel_worker.isRunning())):
             self.status.setText("Please wait for the current connection operation to finish before closing.")
             event.ignore()
             return
@@ -1022,8 +1671,8 @@ def main():
     app = QApplication(sys.argv)
     app.setApplicationName("Luna Desk")
     app.setOrganizationName("LunaDesk")
-    (ROOT / ".luna").mkdir(parents=True, exist_ok=True)
-    lock = QLockFile(str(ROOT / ".luna" / "desktop.lock"))
+    providers.DATA_DIR.mkdir(parents=True, exist_ok=True)
+    lock = QLockFile(str(providers.DATA_DIR / "desktop.lock"))
     lock.setStaleLockTime(0)
     if not lock.tryLock(0):
         QMessageBox.information(None, "Luna Desk is already open", "Close the existing Luna Desk window before starting another desktop session.")
@@ -1037,6 +1686,8 @@ def main():
         return 1
     window = LunaWindow(backend)
     window.show()
+    if "--smoke-test" in sys.argv:
+        QTimer.singleShot(1500, window.close)
     result = app.exec()
     lock.unlock()
     return result
