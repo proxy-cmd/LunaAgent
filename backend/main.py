@@ -643,10 +643,12 @@ async def _run_tool(name: str, args: dict, root: Path, mode: str,
             if cancel_task:
                 cancel_task.cancel()
             output, _ = output_task.result()
-            if task_id:
-                _task_event(task_id, "command", "Command finished with exit code " + str(proc.returncode))
             output_text = output.decode(errors="replace")[:20000]
-            return json.dumps({"exit_code": proc.returncode, "output": _redact_text(output_text)})
+            safe_output = _redact_text(output_text)
+            if task_id:
+                _task_event(task_id, "command",
+                            "Command finished with exit code " + str(proc.returncode) + "\n" + safe_output)
+            return json.dumps({"exit_code": proc.returncode, "output": safe_output})
         if name.startswith("mcp_"):
             if not task_id:
                 return "Permission denied: MCP calls require an active task and approval."

@@ -920,3 +920,25 @@ def test_desktop_automation_requires_enable_and_checks_selected_controls(tmp_pat
     assert all(item["function"]["name"] != "desktop_windows"
                for item in desktop_tools.tool_specs())
     desktop_tools.set_enabled(False)
+
+
+def test_terminal_event_contains_actual_command_output(monkeypatch, tmp_path):
+    events = []
+
+    class Process:
+        pid = 101
+        returncode = 3
+
+        async def communicate(self):
+            return b"real command output\n", None
+
+    async def create_process(*args, **kwargs):
+        return Process()
+
+    monkeypatch.setattr(main.asyncio, "create_subprocess_exec", create_process)
+    monkeypatch.setattr(main, "_command_needs_approval", lambda _: False)
+    monkeypatch.setattr(main, "_task_event", lambda task_id, kind, detail: events.append((task_id, kind, detail)))
+    result = asyncio.run(main._run_tool("run_command", {"command": "Get-ChildItem"},
+                                        tmp_path, "workspace", task_id=99))
+    assert json.loads(result) == {"exit_code": 3, "output": "real command output\n"}
+    assert events == [(99, "command", "Command finished with exit code 3\nreal command output\n")]

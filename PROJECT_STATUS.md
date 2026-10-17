@@ -22,10 +22,33 @@
 - Optional skills, Playwright browser automation, Windows UI Automation, and
   HTTP MCP server integrations. Optional runtimes are documented separately.
 - A local-only FastAPI service, launcher, README, and backend/frontend tests.
+- A PySide6 Qt Widgets desktop client using the same FastAPI backend, provider
+  settings, agent loop, permissions, and task history as the browser edition.
+- Native folder selection, project file tree and read-only text preview,
+  recent-project restoration, permission-mode selection, provider setup and
+  connection testing, streamed task events, cancellation, task history, and
+  diff review/restore controls.
+- A `run-desktop.ps1` source launcher. It starts an owned loopback backend or
+  connects to the existing local service without opening a browser.
+- Browser API errors convert structured validation details to readable text.
+- Native action approval dialogs and a command-output panel display actual,
+  redacted output and exit codes emitted by the shared command runner.
 
 ## Known limits
 
-- The folder chooser is a path field, not a native file picker.
+- The browser folder chooser remains a path field because browsers cannot
+  browse arbitrary host folders. The desktop app uses a native folder picker.
+- The native app is an early functional client, not full feature parity. It
+  does not yet have an interactive terminal, recursive content search,
+  changed-file explorer markers, task resume UI, or desktop settings for skills, MCP, and
+  browser/desktop automation. Use the browser Settings page for those features.
+- Trusted Full Access is not supported by the shared backend. The desktop UI
+  exposes only the enforced read-only and workspace modes.
+- The file tree is rooted at the selected project and its built-in preview is
+  read-only. It is not a separate filesystem permission boundary; model
+  operations remain subject to backend workspace checks.
+- PySide6 Qt Widgets tests run offscreen and do not verify Windows native
+  dialogs or native desktop interactions.
 - Windows command execution is not an OS-level sandbox. Commands run as the
   current user, so approvals do not restrict all possible filesystem access.
 - Desktop automation was exercised with a real UIA click. Desktop text entry
@@ -62,8 +85,9 @@ It was exposed in chat during setup; rotate it after verification.
 
 ## Verification
 
-- `.venv\Scripts\python.exe -m pytest -q`: **57 passed**. Starlette emitted
-  one AnyIO `BlockingPortal` deprecation warning.
+- `.venv\Scripts\python.exe -m pytest -q`: **64 passed** at the desktop
+  integration check. Qt tests used the offscreen platform. One
+  Starlette AnyIO deprecation warning remains.
 - Frontend JavaScript passed `node --check`; `git diff --check` passed. Tests
   cover exact UTF-8 bytes, symlink boundaries, and safe temporary-file creation.
 - Mocked agent end-to-end tests use disposable project folders. A fresh local

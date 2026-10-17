@@ -12,6 +12,41 @@ Python 3.11 or newer is required. In PowerShell, from this folder, run:
 
 Open http://127.0.0.1:8765. First-run settings use Apinex (`https://api.apinex.bond/v1`), model `free/gpt-6-luna`, and Chat Completions. Enter a key, choose **Test Connection**, save the provider, then finish setup. Settings, skills, automation setup, help, and diagnostics remain available if AI is offline.
 
+## Native desktop app (preview)
+
+The desktop client uses PySide6 Qt Widgets and the same local FastAPI process,
+provider configuration, permissions, task database, and agent runtime as the
+browser edition. From PowerShell, run:
+
+```powershell
+.\run-desktop.ps1
+```
+
+The script creates or uses the project `.venv` and installs
+`requirements-desktop.txt` there. The desktop app starts or connects to the
+local service on `127.0.0.1:8765`; it does not open a browser. Use **Open
+Project** or Ctrl+O to open a native Windows folder picker. Ctrl+N focuses the
+task composer, Ctrl+Enter submits, and Ctrl+H opens saved task history. Provider
+settings, connection testing, recent projects, file preview, live task events,
+cancellation, and diff restore are available in native dialogs and panels.
+
+The toolbar permission selector maps directly to the backend's supported modes:
+Restricted (read-only) and Workspace (edits and approved actions). The backend
+does not implement Trusted Full Access. Provider API keys are entered into a
+masked native field and stored through the existing local provider mechanism.
+Advanced skills, MCP, browser automation, desktop automation, pacing controls,
+and diagnostics remain available in the browser Settings page at
+`http://127.0.0.1:8765`.
+
+This first desktop release is a functional native client, but not a full IDE
+replacement: command output is shown in a read-only terminal panel, but there is
+no interactive terminal prompt yet. It also lacks recursive content search,
+changed-file tree markers, task resume, or native editors for skills/MCP and
+automation settings. Sensitive operations use a native approval dialog and
+the existing backend policy. The desktop file preview is read-only. Windows
+native dialogs and UI Automation should be manually checked on each target
+Windows setup.
+
 For a manual launch:
 
 ```powershell
@@ -83,4 +118,9 @@ python -m pip install -r requirements-dev.txt
 python -m pytest -q
 ```
 
-With the browser extra and Chromium installed, the same suite runs a real Playwright interaction against a local fixture. Without it, that test is skipped. Tests do not use provider credentials. The application does not yet support safe resume after any tool has started, task-history deletion, custom provider headers, browser file uploads/downloads, or full MCP extensions. Nested empty folders inside non-empty trees may remain after restoring individual file operations. There is no native folder picker or end-to-end browser UI test.
+For desktop dependencies and Qt tests, install `requirements-desktop.txt` into
+the same virtual environment before running the suite. Tests use Qt's offscreen
+platform where needed; they do not establish that native Windows dialogs or
+desktop automation work on a specific machine.
+
+With the browser extra and Chromium installed, the same suite runs a real Playwright interaction against a local fixture. Without it, that test is skipped. Tests do not use provider credentials. The application does not yet support safe resume after any tool has started, task-history deletion, custom provider headers, browser file uploads/downloads, or full MCP extensions. Nested empty folders inside non-empty trees may remain after restoring individual file operations. There is no end-to-end browser UI test.
