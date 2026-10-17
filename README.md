@@ -43,6 +43,8 @@ Open **Workspace**, enter an existing folder path, and choose **Open Project**. 
 
 Read-only mode can list, search, and read bounded text files. Workspace mode can also edit files, run approved commands, move files or directories, and delete files or directories. Destructive file operations require a separate approval. File changes have snapshots and diffs; restore checks the current file before changing it. Credential files, Git metadata, symlinks, and paths outside the active project are blocked.
 
+For accepted content, the `write_file` tool encodes the supplied text as UTF-8 without changing punctuation, whitespace, or line endings. Its guarantee starts with the content received by the tool; a model can still misunderstand a request for literal text. Read the file back and compare its SHA-256 when exact content matters.
+
 The agent streams provider text and task events to the page with Server-Sent Events. Chat Completions and Responses tool calls use the same bounded workspace tools. Interrupted tasks can be resumed from the beginning only when no tool started before the interruption; resume defaults to read-only. Task history and events are stored in `.luna/history.sqlite3`.
 
 Commands outside the narrow test/build/Git-inspection allowlist pause for approval. Approved PowerShell commands still run as the current Windows user and are not OS-sandboxed. The application does not authenticate other local processes running as the same user.

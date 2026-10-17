@@ -389,12 +389,17 @@ async def _run_tool(name: str, args: dict, root: Path, mode: str,
                     task_id: int | None = None) -> str:
     try:
         if name == "list_files":
-            path = _target(root, args["path"] or ".")
+            value = args["path"] or "."
+            path = _target(root, value)
+            if _contains_link(root, value):
+                return "Permission denied: workspace paths cannot pass through symlinks or junctions."
             entries = [str(p.relative_to(root)) + ("/" if p.is_dir() else "")
                        for p in path.iterdir() if not _sensitive_path(root, p)]
             return json.dumps(entries[:300])
         if name == "read_file":
             path = _target(root, args["path"])
+            if _contains_link(root, args["path"]):
+                return "Permission denied: workspace paths cannot pass through symlinks or junctions."
             if _sensitive_path(root, path):
                 return "Permission denied: this file may contain credentials or repository metadata."
             if path.stat().st_size > 30_000:
@@ -405,14 +410,19 @@ async def _run_tool(name: str, args: dict, root: Path, mode: str,
                 return "Permission denied: this file appears to contain a credential."
             return json.dumps({"content": text, "sha256": hashlib.sha256(raw).hexdigest()})
         if name == "search_files":
-            path = _target(root, args["path"] or ".")
+            value = args["path"] or "."
+            path = _target(root, value)
+            if _contains_link(root, value):
+                return "Permission denied: workspace paths cannot pass through symlinks or junctions."
             query = args["query"]
             if not query or len(query) > 200:
                 return "Search query must contain 1 to 200 characters."
             matches = []
             checked = 0
             for candidate in path.rglob("*"):
-                if candidate.is_dir() or _sensitive_path(root, candidate):
+                relative = str(candidate.relative_to(root))
+                if (candidate.is_dir() or _sensitive_path(root, candidate)
+                        or _contains_link(root, relative)):
                     continue
                 checked += 1
                 if checked > 1000:
@@ -436,6 +446,8 @@ async def _run_tool(name: str, args: dict, root: Path, mode: str,
             if mode != "workspace":
                 return "Permission denied: switch to workspace mode before editing files."
             path = _target(root, args["path"])
+            if _contains_link(root, args["path"]):
+                return "Permission denied: workspace paths cannot pass through symlinks or junctions."
             if _sensitive_path(root, path):
                 return "Permission denied: protected credentials and repository metadata cannot be edited by the agent."
             content = args["content"]
@@ -460,9 +472,9 @@ async def _run_tool(name: str, args: dict, root: Path, mode: str,
             elif expected is not None:
                 return "Edit conflict: the file was removed after it was read."
             path.parent.mkdir(parents=True, exist_ok=True)
+            # The tool receives the model's requested literal text. Preserve its
+            # bytes exactly; in particular, do not inherit the old line endings.
             updated = content
-            if before and "\r\n" in before and "\r\n" not in updated:
-                updated = updated.replace("\n", "\r\n")
             relative = str(path.relative_to(root))
             change_id = None
             if task_id:
@@ -475,9 +487,10 @@ async def _run_tool(name: str, args: dict, root: Path, mode: str,
                 change_id = int(cursor.lastrowid)
                 db.commit()
                 db.close()
-            temp = path.with_name(path.name + ".luna-tmp")
+            temp = path.with_name(path.name + ".luna-tmp-" + uuid.uuid4().hex)
             updated_bytes = updated.encode("utf-8")
-            temp.write_bytes(updated_bytes)
+            with temp.open("xb") as handle:
+                handle.write(updated_bytes)
             if before is None and path.exists():
                 temp.unlink(missing_ok=True)
                 if change_id:

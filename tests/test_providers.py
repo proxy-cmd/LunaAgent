@@ -1,4 +1,7 @@
 import asyncio
+import hashlib
+
+import pytest
 
 from fastapi.testclient import TestClient
 
@@ -239,6 +242,70 @@ def test_file_tools_protect_secrets_and_detect_stale_edits(tmp_path):
     }, root, "workspace"))
     assert "updated" in updated
     assert target.read_text(encoding="utf-8") == "after"
+
+
+def test_write_file_preserves_exact_utf8_content(tmp_path):
+    root = tmp_path / "project"
+    root.mkdir()
+    target = root / "literal.txt"
+    target.write_bytes("old line\r\n".encode("utf-8"))
+    content = "  café!?! \t\r\nsecond line.\n"
+    expected = hashlib.sha256(target.read_bytes()).hexdigest()
+
+    result = asyncio.run(main._run_tool("write_file", {
+        "path": "literal.txt", "content": content,
+        "expected_sha256": expected,
+    }, root, "workspace"))
+
+    written = target.read_bytes()
+    assert "updated" in result
+    assert written == content.encode("utf-8")
+    assert hashlib.sha256(written).hexdigest() == hashlib.sha256(
+        content.encode("utf-8")).hexdigest()
+
+
+def test_file_tools_reject_symlink_paths(tmp_path):
+    root = tmp_path / "project"
+    root.mkdir()
+    target = root / "real.txt"
+    target.write_text("keep me", encoding="utf-8")
+    link = root / "alias.txt"
+    try:
+        link.symlink_to(target)
+    except (OSError, NotImplementedError):
+        pytest.skip("This Windows account cannot create symbolic links.")
+
+    read = asyncio.run(main._run_tool("read_file", {
+        "path": "alias.txt",
+    }, root, "read_only"))
+    write = asyncio.run(main._run_tool("write_file", {
+        "path": "alias.txt", "content": "changed", "expected_sha256": None,
+    }, root, "workspace"))
+
+    assert "Permission denied" in read
+    assert "Permission denied" in write
+    assert target.read_text(encoding="utf-8") == "keep me"
+
+
+def test_write_file_does_not_follow_a_staged_file_symlink(tmp_path):
+    root = tmp_path / "project"
+    root.mkdir()
+    outside = tmp_path / "outside.txt"
+    outside.write_text("keep me", encoding="utf-8")
+    staged = root / "note.txt.luna-tmp"
+    try:
+        staged.symlink_to(outside)
+    except (OSError, NotImplementedError):
+        pytest.skip("This Windows account cannot create symbolic links.")
+
+    result = asyncio.run(main._run_tool("write_file", {
+        "path": "note.txt", "content": "new note", "expected_sha256": None,
+    }, root, "workspace"))
+
+    assert "created" in result
+    assert (root / "note.txt").read_bytes() == b"new note"
+    assert outside.read_text(encoding="utf-8") == "keep me"
+    assert staged.is_symlink()
 
 
 def test_project_selection_persists_and_recent_removal_keeps_directory(tmp_path, monkeypatch):

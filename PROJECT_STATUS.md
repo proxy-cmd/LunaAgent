@@ -15,7 +15,9 @@
 - Chat Completions and Responses request support, tool-call normalization,
   streaming events, task cancellation, safe task resume, and persisted history.
 - Project selection and inspection; bounded file search and reads; guarded
-  writes, moves, deletes, diffs, and conflict-checked restore.
+  writes, moves, deletes, diffs, and conflict-checked restore. File writes
+  preserve supplied UTF-8 text exactly, including newlines and whitespace;
+  writes use unique exclusive temporary files.
 - Explicit approval for risky file, shell, browser, desktop, and MCP actions.
 - Optional skills, Playwright browser automation, Windows UI Automation, and
   HTTP MCP server integrations. Optional runtimes are documented separately.
@@ -47,8 +49,9 @@
   enforced locally; check provider dashboard usage.
 - Restoring moves of directories recreates file entries, but empty nested
   directories are not represented in the file change records.
-- A live agent tool cycle ran, but its exact-output assertion failed because
-  the model added punctuation. A correction attempt was rate limited.
+- A prior live agent test received extra punctuation from the model. The file
+  writer now preserves tool input exactly, but cannot guarantee that a model
+  interprets a literal-content request correctly. Read back and hash the file.
 
 ## Live provider check
 
@@ -59,19 +62,26 @@ It was exposed in chat during setup; rotate it after verification.
 
 ## Verification
 
-- `.venv\Scripts\python.exe -m pytest -q`: **54 passed**. Starlette emitted
+- `.venv\Scripts\python.exe -m pytest -q`: **57 passed**. Starlette emitted
   one AnyIO `BlockingPortal` deprecation warning.
-- `python -m pytest -q`: **53 passed, 1 skipped**. The skip is the real-browser
-  fixture because the global Python environment has no Playwright runtime.
-- Frontend JavaScript passed `node --check`; `git diff --check` passed.
+- Frontend JavaScript passed `node --check`; `git diff --check` passed. Tests
+  cover exact UTF-8 bytes, symlink boundaries, and safe temporary-file creation.
+- Mocked agent end-to-end tests use disposable project folders. A fresh local
+  startup smoke test returned HTTP 200 for `/`, `/api/setup-status`, and
+  `/api/providers` with isolated temporary data.
 - `run.ps1 -NoBrowser` started successfully. The page, setup status, and
   providers endpoints returned HTTP 200. Provider responses include the new
   pacing settings and do not return API keys.
 - The real Playwright browser fixture passed in the virtual environment.
 - A harmless real UI Automation click passed. Desktop typing was mock-tested.
-- The live Apinex connection test passed. The live agent interaction reached
-  tool execution but failed the exact-text assertion; a retry hit a provider
-  rate limit. Responses and streaming behavior remain mock-verified.
-- No live request was made to test the new limiter or retry behavior.
+- An earlier live Apinex connection test passed. Its agent test reached tool
+  execution but failed exact output because the model added punctuation; a
+  correction attempt hit a provider rate limit. Streaming and Responses remain
+  mock-verified.
+- No live provider request was made during this hardening pass. Provider
+  pacing and retries remain verified with deterministic mocked tests.
 
-No commit or push is part of this task.
+Approved shell commands run with the current Windows user's permissions and
+are not OS-sandboxed. The project currently rejects symlink and junction paths
+for its tool operations, but filesystem races between validation and access
+cannot be ruled out completely.
