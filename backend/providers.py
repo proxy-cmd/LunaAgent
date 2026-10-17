@@ -9,6 +9,7 @@ import json
 import os
 import random
 import re
+import sys
 import threading
 import time
 import uuid
@@ -22,9 +23,12 @@ from fastapi import HTTPException
 from pydantic import BaseModel, Field
 
 ROOT = Path(__file__).resolve().parent.parent
-DATA_DIR = Path(os.getenv("LUNA_DATA_DIR", ROOT / ".luna"))
+_default_data = (Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local")) / "LunaDesk"
+                 if getattr(sys, "frozen", False) else ROOT / ".luna")
+DATA_DIR = Path(os.getenv("LUNA_DATA_DIR", _default_data))
 PROVIDERS_FILE = DATA_DIR / "providers.json"
-ENV_FILE = Path(os.getenv("LUNA_ENV_FILE", ROOT / ".env"))
+_default_env = DATA_DIR / ".env" if getattr(sys, "frozen", False) else ROOT / ".env"
+ENV_FILE = Path(os.getenv("LUNA_ENV_FILE", _default_env))
 
 
 class ProviderInput(BaseModel):

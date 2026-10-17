@@ -27,26 +27,49 @@ The script creates or uses the project `.venv` and installs
 local service on `127.0.0.1:8765`; it does not open a browser. Use **Open
 Project** or Ctrl+O to open a native Windows folder picker. Ctrl+N focuses the
 task composer, Ctrl+Enter submits, and Ctrl+H opens saved task history. Provider
-settings, connection testing, recent projects, file preview, live task events,
-cancellation, and diff restore are available in native dialogs and panels.
+settings, connection testing, recent projects, file and content search,
+read-only file preview, live task events, cancellation, task history/recovery,
+diff restore, and native automation controls are available in panels and dialogs.
 
 The toolbar permission selector maps directly to the backend's supported modes:
 Restricted (read-only) and Workspace (edits and approved actions). The backend
 does not implement Trusted Full Access. Provider API keys are entered into a
 masked native field and stored through the existing local provider mechanism.
-The native integrations view manages skills and MCP servers, and controls
-browser-session and Windows desktop-access state. The browser Settings page at
-`http://127.0.0.1:8765` retains its detailed automation controls, help, and
-diagnostics.
+The native integrations view manages skills and MCP servers and provides
+browser-session and Windows desktop-automation controls. The browser Settings
+page at `http://127.0.0.1:8765` retains help and diagnostics.
 
-This first desktop release is a functional native client, but not a full IDE
-replacement: command output is shown in a read-only terminal panel, but there is
-no interactive terminal prompt yet. It also lacks recursive file content search,
-changed-file tree markers, task resume, and detailed native browser/desktop
-automation controls. Sensitive operations use a native approval dialog and
-the existing backend policy. The desktop file preview is read-only. Windows
-native dialogs and UI Automation should be manually checked on each target
-Windows setup.
+The terminal starts a persistent PowerShell process in a Windows ConPTY session
+only when you choose **Start PowerShell**. Enter commands or program input in
+the line field, choose its working folder, and use **Terminate** to stop the
+shell Luna started. Output is incremental, combines stdout and stderr, is capped
+at 1 MB, and the shell terminates after four hours. The pane does not emulate
+all terminal keys or resize behavior, so full-screen terminal applications are
+unsupported. Manual shell commands run with your Windows account permissions
+and are not OS-sandboxed. Agent commands remain separate and use the backend's
+approval policy.
+
+Use **Search file contents** to find text under the active project. Search
+returns file and line previews, skips hidden and protected paths, `.gitignore`
+matches, symlinks, binary/unreadable files, and files over 500 KB. It scans at
+most 10,000 files for 15 seconds and returns at most 100 results; cancellation
+closes the streaming request. The file tree marks changes from the latest
+reviewed task and the change panel keeps task IDs, operations, and statuses.
+Markers are not a complete Git status view and show the latest task only.
+
+Task history shows recorded events and skills. Resume is offered only for an
+interrupted task with no tool or command event, and only in its original
+project. It retries from the beginning after a confirmation; the permission
+mode is chosen again. Other interrupted work can be started as a new task with
+the recorded request and response prefilled.
+
+Native automation exposes browser session setup, permitted navigation, page
+inspection, screenshots, and confirmed click/fill actions. Local browser access
+must be selected before starting a session. Windows desktop controls list and
+inspect visible windows; click and type ask for confirmation. Desktop controls
+require the optional Windows UI Automation dependency and never elevate or
+bypass UAC. Native dialogs and real interactions should be checked on each
+target Windows setup.
 
 For a manual launch:
 
@@ -124,4 +147,22 @@ the same virtual environment before running the suite. Tests use Qt's offscreen
 platform where needed; they do not establish that native Windows dialogs or
 desktop automation work on a specific machine.
 
-With the browser extra and Chromium installed, the same suite runs a real Playwright interaction against a local fixture. Without it, that test is skipped. Tests do not use provider credentials. The application does not yet support safe resume after any tool has started, task-history deletion, custom provider headers, browser file uploads/downloads, or full MCP extensions. Nested empty folders inside non-empty trees may remain after restoring individual file operations. There is no end-to-end browser UI test.
+With the browser extra and Chromium installed, the same suite runs a real Playwright interaction against a local fixture. Without it, that test is skipped. Tests do not use provider credentials. The application does not support resume after any tool has started, task-history deletion, custom provider headers, browser file uploads/downloads, or full MCP extensions. Nested empty folders inside non-empty trees may remain after restoring individual file operations. There is no end-to-end browser UI test.
+
+## Build a Windows desktop package
+
+From PowerShell in the repository root, run:
+
+```powershell
+.\run-desktop.ps1
+.\build-desktop.ps1
+```
+
+The PyInstaller build writes `dist\LunaDesk\LunaDesk.exe` and the onedir
+`LunaBackend.exe` child and its runtime files beside it. The build script installs packaging and Playwright
+Python dependencies into `.venv`; it does not bundle `.env`, `.luna` data,
+task history, or projects. Browser automation also needs Chromium installed
+separately for the same Python environment with
+`.\.venv\Scripts\python.exe -m playwright install chromium`. Packaged user
+settings and keys are stored under `%LOCALAPPDATA%\LunaDesk`. The package is
+unsigned; no installer or custom application icon is provided.

@@ -1,5 +1,25 @@
 # Luna Desk project status
 
+## Final completion pass checklist
+
+- [x] Confirm `main`, `origin/main`, the three reported desktop commits, and a
+  clean starting tree; baseline `.venv\Scripts\python.exe -m pytest -q`:
+  **66 passed**.
+- [x] Add native interactive terminal subset with explicit process lifecycle,
+  incremental bounded output, and documented ConPTY limitations.
+- [x] Add recursive content search and cancellation in the active project,
+  including ignored, hidden, binary, large, and protected-file handling.
+- [x] Add task recovery/resume controls and changed-file indicators to the
+  native client.
+- [x] Audit and complete native browser/desktop automation inspection and
+  action controls; verify skills/MCP schemas and task skill history.
+- [x] Review shared backend permissions, recovery, provider pacing, and
+  browser regressions; add focused tests for any gaps found.
+- [x] Create reproducible Windows packaging configuration, update user docs,
+  run the feasible verification suite, then commit and push verified changes.
+
+Items are checked only after implementation and evidence are recorded below.
+
 ## Implemented
 
 - First-run provider setup with prefilled Apinex settings, masked key entry,
@@ -35,15 +55,39 @@
   redacted output and exit codes emitted by the shared command runner.
 - Native provider pacing/retry settings, masked key replacement/removal,
   skill management, MCP server management, and automation state controls.
+- Persistent native PowerShell ConPTY child with line input, combined
+  incremental stdout/stderr, working-directory selection, a 1 MB output cap,
+  four-hour timeout, exit state, and child-only termination. Full-screen TUI
+  key controls and dynamic terminal resizing are not supported.
+- Streamed, cancellable native content search scoped to the active workspace;
+  hidden/sensitive/binary/large files and ignored paths are skipped, with file,
+  time, and result bounds.
+- Native task recovery details, recorded event and skill history, guarded
+  resume for interrupted tasks with no tool event, and create-new-from-context.
+- Latest-task file change panel and explorer labels for added, modified,
+  deleted, moved, and restored paths.
+- Native browser navigation, page text, screenshot, explicitly confirmed click
+  and fill, session cancellation/close, and loopback opt-in controls. Native
+  desktop window selection, control inspection, screenshot, and confirmed
+  click/type controls. MCP tool schemas and errors can be inspected.
+- Reproducible PyInstaller specs and a PowerShell packaging script. Frozen
+  settings and credentials use `%LOCALAPPDATA%\\LunaDesk` instead of the
+  application bundle directory.
 
 ## Known limits
 
 - The browser folder chooser remains a path field because browsers cannot
   browse arbitrary host folders. The desktop app uses a native folder picker.
-- The native app is an early functional client, not full feature parity. It
-  does not yet have an interactive terminal, recursive content search,
-  changed-file explorer markers, task resume UI, or the detailed browser and
-  desktop automation controls available in the browser Settings page.
+- The native terminal uses Windows ConPTY for line-oriented interaction. Full-
+  screen, raw-key, and resize-dependent terminal programs are unsupported.
+  Manual terminal commands are run as the current user and are not OS-sandboxed.
+- Content search skips hidden paths and uses a bounded `.gitignore` matcher;
+  it is not a complete Git status implementation. Explorer labels show only
+  the latest reviewed task; Git-external edits do not receive task markers.
+- Task resume replays the original request from the beginning and is available
+  only when interrupted before any recorded tool/command event. It cannot
+  resume after a tool execution, inspect external side effects, or reconstruct
+  a provider's exact internal checkpoint.
 - Trusted Full Access is not supported by the shared backend. The desktop UI
   exposes only the enforced read-only and workspace modes.
 - The file tree is rooted at the selected project and its built-in preview is
@@ -51,6 +95,11 @@
   operations remain subject to backend workspace checks.
 - PySide6 Qt Widgets tests run offscreen and do not verify Windows native
   dialogs or native desktop interactions.
+- Browser/desktop native controls are covered with mocks and share the APIs
+  used by the browser edition; this pass did not manually approve a real click
+  or type action in an external target application.
+- The PyInstaller output is an unsigned folder package, not an installer.
+  Chromium remains an external runtime, and the package has no custom icon.
 - Windows command execution is not an OS-level sandbox. Commands run as the
   current user, so approvals do not restrict all possible filesystem access.
 - Desktop automation was exercised with a real UIA click. Desktop text entry
@@ -90,6 +139,10 @@ It was exposed in chat during setup; rotate it after verification.
 - `.venv\Scripts\python.exe -m pytest -q`: **66 passed** at the desktop
   integration check. Qt tests used the offscreen platform. One
   Starlette AnyIO deprecation warning remains.
+- Final completion pass adds search scope/ignore/result-cap/disconnect tests and
+  Qt tests for a real PowerShell Read-Host exchange, output bounds, protected previews, and
+  explorer change labels. Latest run: `.venv\\Scripts\\python.exe -m pytest -q`
+  — **73 passed**.
 - Frontend JavaScript passed `node --check`; `git diff --check` passed. Tests
   cover exact UTF-8 bytes, symlink boundaries, and safe temporary-file creation.
 - Mocked agent end-to-end tests use disposable project folders. A fresh local
@@ -106,6 +159,13 @@ It was exposed in chat during setup; rotate it after verification.
   mock-verified.
 - No live provider request was made during this hardening pass. Provider
   pacing and retries remain verified with deterministic mocked tests.
+- `.\build-desktop.ps1` produced the onedir package. The packaged app returned
+  HTTP 200 from `/api/setup-status`, `/api/providers`, and
+  `/api/browser/status` using isolated temporary data. Closing its smoke-test
+  window exited both packaged executables and released port 8765.
+- PowerShell ConPTY interaction passed a real `Read-Host` input/output round
+  trip and preserved shell exit code 7. Native dialogs, external desktop
+  automation, and packaged ConPTY interaction were not manually exercised.
 
 Approved shell commands run with the current Windows user's permissions and
 are not OS-sandboxed. The project currently rejects symlink and junction paths
