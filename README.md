@@ -40,7 +40,7 @@ and diagnostics remain available in the browser Settings page at
 
 This first desktop release is a functional native client, but not a full IDE
 replacement: command output is shown in a read-only terminal panel, but there is
-no interactive terminal prompt yet. It also lacks recursive content search,
+no interactive terminal prompt yet. It also lacks recursive file content search,
 changed-file tree markers, task resume, or native editors for skills/MCP and
 automation settings. Sensitive operations use a native approval dialog and
 the existing backend policy. The desktop file preview is read-only. Windows

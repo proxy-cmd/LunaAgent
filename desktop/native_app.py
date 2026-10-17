@@ -9,13 +9,13 @@ import time
 from pathlib import Path
 
 import httpx
-from PySide6.QtCore import QDir, QLockFile, QSettings, QThread, Qt, Signal
+from PySide6.QtCore import QDir, QLockFile, QSettings, QSortFilterProxyModel, QThread, Qt, Signal
 from PySide6.QtGui import QAction, QFont
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFileSystemModel,
     QFormLayout, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox,
-    QPlainTextEdit, QPushButton, QSplitter, QStatusBar, QTreeView, QVBoxLayout,
-    QWidget, QDockWidget, QInputDialog,
+    QPlainTextEdit, QPushButton, QSplitter, QStatusBar,
+    QTreeView, QVBoxLayout, QWidget, QDockWidget, QInputDialog,
 )
 
 BASE_URL = "http://127.0.0.1:8765"
@@ -89,15 +89,18 @@ class TaskWorker(QThread):
     finished_task = Signal(dict)
     failed = Signal(str)
 
-    def __init__(self, message: str, mode: str):
+    def __init__(self, message: str, mode: str, workspace: str):
         super().__init__()
         self.message = message
         self.mode = mode
+        self.workspace = workspace
         self.task_id: int | None = None
 
     def run(self):
         try:
-            started = request("POST", "/api/tasks", json={"message": self.message, "mode": self.mode})
+            started = request("POST", "/api/tasks", json={"message": self.message,
+                                                              "mode": self.mode,
+                                                              "workspace": self.workspace})
             self.task_id = started["id"]
             cursor = 0
             # The existing SSE endpoint replays persisted events and closes when the task ends.
@@ -206,7 +209,11 @@ class LunaWindow(QMainWindow):
         self.fs_model.setReadOnly(True)
         self.fs_model.setResolveSymlinks(False)
         self.fs_model.setFilter(QDir.Dirs | QDir.Files | QDir.NoDotAndDotDot)
-        self.files.setModel(self.fs_model)
+        self.fs_proxy = QSortFilterProxyModel(self)
+        self.fs_proxy.setSourceModel(self.fs_model)
+        self.fs_proxy.setRecursiveFilteringEnabled(True)
+        self.fs_proxy.setFilterCaseSensitivity(Qt.CaseInsensitive)
+        self.files.setModel(self.fs_proxy)
         self.files.setColumnWidth(0, 240)
         self.files.doubleClicked.connect(self.preview_file)
         left = QWidget()
@@ -287,7 +294,7 @@ class LunaWindow(QMainWindow):
             self.project_label.setToolTip(str(self.project))
             self.project_path.setText(str(self.project))
             self.fs_model.setRootPath(str(self.project))
-            self.files.setRootIndex(self.fs_model.index(str(self.project)))
+            self.files.setRootIndex(self.fs_proxy.mapFromSource(self.fs_model.index(str(self.project))))
             self.settings.setValue("project/last", str(self.project))
             self.refresh_projects()
             self.status.showMessage(f"Opened {self.project}", 5000)
@@ -390,15 +397,11 @@ class LunaWindow(QMainWindow):
         dialog.exec()
 
     def filter_tree(self, value: str):
-        # Hide rows by name while leaving the selected project's filesystem model intact.
-        root = self.files.rootIndex()
-        for row in range(self.fs_model.rowCount(root)):
-            idx = self.fs_model.index(row, 0, root)
-            hidden = bool(value) and value.casefold() not in self.fs_model.fileName(idx).casefold()
-            self.files.setRowHidden(row, root, hidden)
+        self.fs_proxy.setFilterFixedString(value)
 
     def preview_file(self, index):
-        path = Path(self.fs_model.filePath(index))
+        source_index = self.fs_proxy.mapToSource(index)
+        path = Path(self.fs_model.filePath(source_index))
         if not path.is_file() or path.stat().st_size > 1_000_000:
             return
         try:
@@ -428,7 +431,7 @@ class LunaWindow(QMainWindow):
         self.composer.clear()
         self.run_button.setEnabled(False)
         self.stop_button.setEnabled(True)
-        self.worker = TaskWorker(message, self.mode.currentData())
+        self.worker = TaskWorker(message, self.mode.currentData(), str(self.project))
         self.worker.event.connect(self.on_event)
         self.worker.approval_requested.connect(self.confirm_approval)
         self.worker.finished_task.connect(self.on_finished)

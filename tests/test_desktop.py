@@ -95,3 +95,32 @@ def test_backend_stops_only_the_child_it_started(monkeypatch, tmp_path):
     backend.stop()
     assert child.stopped
     assert backend.process is None
+
+
+def test_task_submission_names_the_selected_workspace(monkeypatch):
+    calls = []
+
+    class Stream:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def raise_for_status(self):
+            pass
+
+        def iter_lines(self):
+            return iter(())
+
+    def fake_request(method, path, **kwargs):
+        calls.append((method, path, kwargs))
+        return {"id": 7} if path == "/api/tasks" else {"id": 7, "status": "completed"}
+
+    monkeypatch.setattr(native_app, "request", fake_request)
+    monkeypatch.setattr(native_app.httpx, "stream", lambda *args, **kwargs: Stream())
+    worker = native_app.TaskWorker("Inspect this project", "read_only", r"D:\Projects\Native")
+    worker.start()
+    assert worker.wait(5000)
+    post = next(call for call in calls if call[1] == "/api/tasks")
+    assert post[2]["json"]["workspace"] == r"D:\Projects\Native"

@@ -85,7 +85,7 @@ It was exposed in chat during setup; rotate it after verification.
 
 ## Verification
 
-- `.venv\Scripts\python.exe -m pytest -q`: **64 passed** at the desktop
+- `.venv\Scripts\python.exe -m pytest -q`: **65 passed** at the desktop
   integration check. Qt tests used the offscreen platform. One
   Starlette AnyIO deprecation warning remains.
 - Frontend JavaScript passed `node --check`; `git diff --check` passed. Tests
