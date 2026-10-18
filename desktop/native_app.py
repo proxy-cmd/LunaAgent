@@ -19,7 +19,7 @@ from PySide6.QtWidgets import (
     QCheckBox, QDoubleSpinBox, QFormLayout, QHBoxLayout, QLabel, QLineEdit,
     QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
     QPlainTextEdit, QPushButton, QSplitter, QStatusBar,
-    QSpinBox, QTreeView, QVBoxLayout, QWidget, QDockWidget, QInputDialog, QTabWidget,
+    QSpinBox, QTreeView, QVBoxLayout, QWidget, QDockWidget, QTabWidget,
     QToolButton, QStyle,
     QTreeWidget, QTreeWidgetItem,
 )
@@ -819,7 +819,38 @@ class LunaWindow(QMainWindow):
         row.addWidget(self.run_button)
         row.addWidget(self.stop_button)
         chat_layout.addLayout(row)
-        chat_split.addWidget(chat)
+        self.right_pages = QTabWidget()
+        self.right_pages.addTab(chat, "Agent")
+        history_page = QWidget()
+        history_layout = QVBoxLayout(history_page)
+        history_layout.setContentsMargins(8, 8, 8, 8)
+        history_header = QHBoxLayout()
+        history_header.addWidget(QLabel("TASK HISTORY"), 1)
+        history_reload = QPushButton("Refresh")
+        history_reload.clicked.connect(self.refresh_history_panel)
+        history_header.addWidget(history_reload)
+        history_layout.addLayout(history_header)
+        self.history_list = QListWidget()
+        self.history_list.setMaximumHeight(190)
+        self.history_list.currentItemChanged.connect(lambda *_: self.load_history_item())
+        history_layout.addWidget(self.history_list)
+        self.history_details = QPlainTextEdit()
+        self.history_details.setReadOnly(True)
+        self.history_details.setPlaceholderText("Select a saved task to review its summary and progress.")
+        history_layout.addWidget(self.history_details, 1)
+        history_actions = QHBoxLayout()
+        self.history_review = QPushButton("Review changes")
+        self.history_review.clicked.connect(self.review_history_changes)
+        self.history_resume = QPushButton("Resume")
+        self.history_resume.clicked.connect(self.resume_history_task)
+        history_new = QPushButton("Continue in Agent")
+        history_new.clicked.connect(self.continue_history_task)
+        history_actions.addWidget(self.history_review)
+        history_actions.addWidget(self.history_resume)
+        history_actions.addWidget(history_new)
+        history_layout.addLayout(history_actions)
+        self.right_pages.addTab(history_page, "History")
+        chat_split.addWidget(self.right_pages)
         chat_split.setSizes([620, 320])
         split.addWidget(left)
         split.addWidget(chat_split)
@@ -995,62 +1026,90 @@ class LunaWindow(QMainWindow):
         IntegrationsDialog(self).exec()
 
     def show_history(self):
+        self.right_pages.setCurrentIndex(1)
+        self.refresh_history_panel()
+
+    def refresh_history_panel(self):
         try:
-            data = request("GET", "/api/history")
+            items = request("GET", "/api/history").get("tasks", [])
         except Exception as exc:
-            QMessageBox.critical(self, "Task history", str(exc))
+            self.history_details.setPlainText("Could not load task history: " + str(exc))
             return
-        items = data.get("tasks", [])
+        previous = self.history_list.currentItem().data(Qt.UserRole).get("id") if self.history_list.currentItem() else None
+        self.history_list.clear()
+        for task in items:
+            label = f"#{task['id']}  {task['status']}  {task['message'][:100]}"
+            item = QListWidgetItem(label)
+            item.setData(Qt.UserRole, task)
+            self.history_list.addItem(item)
+            if task.get("id") == previous:
+                self.history_list.setCurrentItem(item)
+        if self.history_list.count() and not self.history_list.currentItem():
+            self.history_list.setCurrentRow(0)
         if not items:
-            QMessageBox.information(self, "Task history", "No saved tasks yet.")
+            self.history_details.setPlainText("No saved tasks yet.")
+            self.history_state = None
+            self.history_review.setEnabled(False)
+            self.history_resume.setEnabled(False)
+
+    def load_history_item(self):
+        item = self.history_list.currentItem()
+        if not item:
+            self.history_state = None
             return
-        labels = [f"#{item['id']} · {item['status']} · {item['message'][:100]}" for item in items]
-        label, ok = QInputDialog.getItem(self, "Task history", "Select a saved task:", labels, 0, False)
-        if not ok:
-            return
-        selected = items[labels.index(label)]
+        task = item.data(Qt.UserRole)
         try:
-            state = request("GET", f"/api/tasks/{selected['id']}")
+            state = request("GET", f"/api/tasks/{task['id']}")
+            used_skills = request("GET", f"/api/tasks/{task['id']}/skills").get("skills", [])
         except Exception as exc:
-            QMessageBox.warning(self, "Task history", str(exc))
+            self.history_state = None
+            self.history_details.setPlainText("Could not load this task: " + str(exc))
             return
+        self.history_state = state
         events = state.get("events", [])
         event_text = "\n".join(
-            f"{event['created']} [{event['kind']}] {event['detail'].splitlines()[0][:240]}"
+            f"{event['created']}  {event['kind']}: {event['detail'].splitlines()[0][:180]}"
             for event in events)
-        try:
-            used_skills = request("GET", f"/api/tasks/{selected['id']}/skills").get("skills", [])
-        except Exception:
-            used_skills = []
-        reason = "Safe to resume: no tool had started before interruption." if state.get("can_resume") else "This task cannot be replayed safely." if state.get("status") == "interrupted" else "Resume is available only for interrupted tasks."
-        details = f"{state.get('answer') or state.get('error') or state['message']}\n\n{reason}\nSkills used: {', '.join(used_skills) or '(none recorded)'}\n\nRecorded events:\n{event_text or '(none)'}"
-        box = QMessageBox(self)
-        box.setWindowTitle(f"Task #{selected['id']} · {selected['status']}")
-        box.setText(f"{selected['message']}\n\n{reason}")
-        box.setDetailedText(details)
-        review = box.addButton("Review changes", QMessageBox.ActionRole)
-        resume = box.addButton("Resume safely", QMessageBox.AcceptRole)
-        new_task = box.addButton("New task from context", QMessageBox.ActionRole)
-        close = box.addButton(QMessageBox.Close)
-        resume.setEnabled(bool(state.get("can_resume")))
-        box.setDefaultButton(close)
-        box.exec()
-        clicked = box.clickedButton()
-        self.transcript.appendPlainText(f"\nHistory · {selected['status']}\n{details}\n")
-        if clicked is review:
-            self.last_task_id = selected["id"]
-            self.review_changes(selected["id"])
-            self.refresh_changes(selected["id"])
-        elif clicked is resume:
+        safe_to_resume = bool(state.get("can_resume"))
+        reason = ("Safe to resume: no tool had started before interruption." if safe_to_resume
+                  else "Resume is available only for interrupted tasks with no tool activity.")
+        answer = state.get("answer") or state.get("error") or state.get("message")
+        details = (f"{answer}\n\n{reason}\nSkills used: {', '.join(used_skills) or '(none recorded)'}"
+                   f"\n\nProgress\n{event_text or '(none recorded)'}")
+        self.history_details.setPlainText(details)
+        same_project = bool(self.project and Path(state.get("workspace", "")).resolve() == self.project.resolve())
+        self.history_review.setEnabled(same_project)
+        self.history_resume.setEnabled(safe_to_resume and same_project)
+        if not same_project:
+            self.history_details.appendPlainText("\n\nOpen the original project to review or resume this task.")
+
+    def review_history_changes(self):
+        state = getattr(self, "history_state", None)
+        if not state or not self.history_review.isEnabled():
+            return
+        self.last_task_id = state["id"]
+        self.refresh_changes(state["id"])
+        self.right_pages.setCurrentIndex(0)
+        self.findChild(QDockWidget, "changes-dock").show()
+
+    def resume_history_task(self):
+        state = getattr(self, "history_state", None)
+        if state and self.history_resume.isEnabled():
             self.resume_saved_task(state)
-        elif clicked is new_task:
-            self.composer.setPlainText(
-                f"Continue from task #{selected['id']} using this recorded context.\n"
-                f"Original request: {selected['message']}\n"
-                f"Recorded response: {selected.get('answer') or selected.get('error') or '(none)'}\n\n"
-                "New request: ")
-            self.composer.setFocus()
-        return
+
+    def continue_history_task(self):
+        item = self.history_list.currentItem()
+        if not item:
+            return
+        task = item.data(Qt.UserRole)
+        state = getattr(self, "history_state", None) or task
+        self.composer.setPlainText(
+            f"Continue from task #{task['id']} using this recorded context.\n"
+            f"Original request: {task['message']}\n"
+            f"Recorded response: {state.get('answer') or state.get('error') or '(none)'}\n\n"
+            "New request: ")
+        self.right_pages.setCurrentIndex(0)
+        self.composer.setFocus()
 
     def resume_saved_task(self, state: dict):
         if not state.get("can_resume"):
@@ -1058,68 +1117,19 @@ class LunaWindow(QMainWindow):
         if not self.project or Path(state.get("workspace", "")).resolve() != self.project.resolve():
             QMessageBox.information(self, "Open the original project", "Resume is allowed only after reopening the project that owns this task.")
             return
-        mode, ok = QInputDialog.getItem(self, "Resume task", "Choose permissions for this retry:",
-                                        ["Restricted · read only", "Workspace · edits and approved actions"], 0, False)
-        if not ok:
-            return
-        permission = "workspace" if mode.startswith("Workspace") else "read_only"
+        permission = self.mode.currentData()
+        mode_label = "Workspace" if permission == "workspace" else "Read only"
         confirm = QMessageBox.question(self, "Resume from the beginning",
-            "This task had not started a tool, so Luna can safely retry it. The original request will run again with the selected permission mode. Continue?",
+            f"This task had not started a tool. Luna will retry it from the beginning in {mode_label} mode. Continue?",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if confirm != QMessageBox.Yes:
             return
-        self.mode.setCurrentIndex(max(0, self.mode.findData(permission)))
         try:
             request("POST", f"/api/tasks/{state['id']}/resume", json={"mode": permission})
         except Exception as exc:
             QMessageBox.warning(self, "Could not resume task", str(exc))
             return
         self._start_task_worker(state["message"], permission, state["workspace"], state["id"])
-
-    def review_changes(self, task_id: int):
-        try:
-            changes = request("GET", f"/api/tasks/{task_id}/changes").get("changes", [])
-        except Exception as exc:
-            QMessageBox.warning(self, "Change review", str(exc))
-            return
-        if not changes:
-            return
-        dialog = QDialog(self)
-        dialog.setWindowTitle(f"Changes from task #{task_id}")
-        dialog.resize(900, 650)
-        layout = QVBoxLayout(dialog)
-        chooser = QComboBox()
-        for change in changes:
-            chooser.addItem(f"{change['path']} · {change['status']}", change)
-        diff = QPlainTextEdit()
-        diff.setReadOnly(True)
-        diff.setFont(QFont("Cascadia Code", 10))
-        restore = QPushButton("Restore this change")
-        def show_change(index: int):
-            item = chooser.itemData(index)
-            diff.setPlainText(item.get("diff") or "No textual diff is available.")
-            restore.setEnabled(item.get("status") == "applied")
-        def restore_change():
-            item = chooser.currentData()
-            answer = QMessageBox.question(dialog, "Restore change", f"Restore {item['path']} to its pre-task contents?", QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-            if answer != QMessageBox.Yes:
-                return
-            try:
-                request("POST", f"/api/changes/{item['id']}/restore")
-                item["status"] = "restored"
-                chooser.setItemText(chooser.currentIndex(), f"{item['path']} · restored")
-                restore.setEnabled(False)
-            except Exception as exc:
-                QMessageBox.warning(dialog, "Restore failed", str(exc))
-        chooser.currentIndexChanged.connect(show_change)
-        restore.clicked.connect(restore_change)
-        layout.addWidget(chooser)
-        layout.addWidget(diff, 1)
-        layout.addWidget(restore)
-        show_change(0)
-        dialog.exec()
-        if self.project:
-            self.refresh_changes(task_id)
 
     def refresh_changes(self, task_id: int):
         try:
@@ -1866,6 +1876,20 @@ class ProviderDialog(QDialog):
         self.protocol.addItem("Chat Completions", "chat_completions")
         self.protocol.addItem("Responses", "responses")
         form.addRow("Protocol", self.protocol)
+        layout.addLayout(form)
+        advanced_toggle = QToolButton()
+        advanced_toggle.setText("Advanced request and agent settings")
+        advanced_toggle.setCheckable(True)
+        advanced_toggle.setChecked(False)
+        advanced_toggle.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        advanced_toggle.setArrowType(Qt.RightArrow)
+        layout.addWidget(advanced_toggle)
+        advanced_content = QWidget()
+        advanced_form = QFormLayout(advanced_content)
+        advanced_content.setVisible(False)
+        advanced_toggle.toggled.connect(advanced_content.setVisible)
+        advanced_toggle.toggled.connect(
+            lambda expanded: advanced_toggle.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow))
         self.numeric = {}
         for key, title, minimum, maximum, value in (
             ("timeout", "Request timeout (seconds)", 5, 300, 60),
@@ -1880,15 +1904,15 @@ class ProviderDialog(QDialog):
             spin.setRange(minimum, maximum)
             spin.setValue(value)
             self.numeric[key] = spin
-            form.addRow(title, spin)
+            advanced_form.addRow(title, spin)
         self.numeric["min_request_interval_seconds"] = QDoubleSpinBox()
         self.numeric["min_request_interval_seconds"].setRange(0, 3600)
         self.numeric["min_request_interval_seconds"].setDecimals(2)
         self.numeric["min_request_interval_seconds"].setValue(12)
-        form.addRow("Minimum request interval (seconds)", self.numeric["min_request_interval_seconds"])
+        advanced_form.addRow("Minimum request interval (seconds)", self.numeric["min_request_interval_seconds"])
         self.streaming = QCheckBox("Prefer streaming responses")
-        form.addRow("Streaming", self.streaming)
-        layout.addLayout(form)
+        advanced_form.addRow("Streaming", self.streaming)
+        layout.addWidget(advanced_content)
         self.message = QLabel("")
         self.message.setWordWrap(True)
         layout.addWidget(self.message)
@@ -1910,11 +1934,13 @@ class ProviderDialog(QDialog):
         actions.addWidget(add)
         actions.addWidget(self.test_button)
         actions.addWidget(save)
-        actions.addWidget(default)
-        actions.addWidget(finish)
-        actions.addWidget(remove_key)
-        actions.addWidget(remove_provider)
         layout.addLayout(actions)
+        advanced_actions = QHBoxLayout()
+        advanced_actions.addWidget(default)
+        advanced_actions.addWidget(finish)
+        advanced_actions.addWidget(remove_key)
+        advanced_actions.addWidget(remove_provider)
+        advanced_content.layout().addRow(advanced_actions)
         buttons = QDialogButtonBox(QDialogButtonBox.Close)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)

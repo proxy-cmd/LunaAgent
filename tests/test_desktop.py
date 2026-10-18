@@ -113,10 +113,54 @@ def test_agent_activity_is_expandable_and_keeps_command_logs_out_of_chat(app, mo
     window.close()
 
 
+def test_task_history_stays_in_the_agent_panel(app, monkeypatch, tmp_path):
+    project = tmp_path / "HistoryProject"
+    project.mkdir()
+    task = {"id": 7, "message": "Inspect the project", "status": "completed",
+            "workspace": str(project), "answer": "The project is healthy.", "error": None,
+            "can_resume": False,
+            "events": [{"created": "today", "kind": "command",
+                        "detail": "Command finished with exit code 0\nlarge raw log"}]}
+
+    def fake_request(method, path, **kwargs):
+        if path == "/api/projects":
+            return {"active_project": None, "recent_projects": []}
+        if path == "/api/projects/open":
+            return {"active_project": str(project), "recent_projects": []}
+        if path == "/api/providers":
+            return {"providers": []}
+        if path == "/api/history":
+            return {"tasks": [task]}
+        if path == "/api/tasks/7":
+            return task
+        if path == "/api/tasks/7/skills":
+            return {"skills": []}
+        raise AssertionError((method, path))
+
+    monkeypatch.setattr(native_app, "request", fake_request)
+    window = native_app.LunaWindow(native_app.Backend())
+    window.backend.stop = lambda: None
+    window.set_project(str(project))
+    window.show_history()
+
+    assert window.right_pages.currentIndex() == 1
+    assert window.history_list.count() == 1
+    assert "The project is healthy." in window.history_details.toPlainText()
+    assert "large raw log" not in window.history_details.toPlainText()
+    window.continue_history_task()
+    assert window.right_pages.currentIndex() == 0
+    assert "Original request: Inspect the project" in window.composer.toPlainText()
+    window.composer.clear()
+    window.close()
+
+
 def test_native_provider_key_entry_is_masked(app, monkeypatch):
     monkeypatch.setattr(native_app, "request", lambda method, path, **kwargs: {"providers": []})
     dialog = native_app.ProviderDialog()
     assert dialog.fields["api_key"].echoMode() == dialog.fields["api_key"].EchoMode.Password
+    advanced = next(item for item in dialog.findChildren(native_app.QToolButton)
+                    if item.text() == "Advanced request and agent settings")
+    assert not advanced.isChecked()
     dialog.numeric["retry_limit"].setValue(4)
     assert dialog.payload()["retry_limit"] == 4
     dialog.close()
