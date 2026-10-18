@@ -7,7 +7,7 @@ import pytest
 
 pytest.importorskip("PySide6")
 from PySide6.QtWidgets import QApplication
-from PySide6.QtCore import QSettings
+from PySide6.QtCore import QSettings, Qt
 
 from desktop import native_app
 
@@ -43,6 +43,73 @@ def test_native_window_uses_shared_provider_and_project_apis(app, monkeypatch, t
     assert any(path == "/api/projects/open" for _, path, _ in calls)
     assert any(path == "/api/providers" for _, path, _ in calls)
     window.settings = QSettings(str(tmp_path / "ui.ini"), QSettings.IniFormat)
+    window.close()
+
+
+def test_native_ide_embeds_editor_agent_and_workspace_explorer(app, monkeypatch, tmp_path):
+    project = tmp_path / "DeskProject"
+    outside = tmp_path / "Outside"
+    project.mkdir()
+    outside.mkdir()
+    source = project / "main.py"
+    source.write_text("def greet():\n    return 'hello'\n", encoding="utf-8")
+    outside_file = outside / "secret.py"
+    outside_file.write_text("private", encoding="utf-8")
+    try:
+        (project / "external").symlink_to(outside, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pass
+
+    def fake_request(method, path, **kwargs):
+        if path == "/api/projects":
+            return {"active_project": None, "recent_projects": []}
+        if path == "/api/providers":
+            return {"providers": []}
+        if path == "/api/projects/open":
+            return {"active_project": str(project), "recent_projects": []}
+        raise AssertionError((method, path))
+
+    monkeypatch.setattr(native_app, "request", fake_request)
+    window = native_app.LunaWindow(native_app.Backend())
+    window.backend.stop = lambda: None
+    window.set_project(str(project))
+
+    assert window.files.rootIndex().data() == project.name
+    assert window.findChild(native_app.QSplitter, "editor-agent-splitter").orientation() == Qt.Horizontal
+    assert window.transcript.parent() is not None
+    assert all(not window.findChild(native_app.QDockWidget, name).isVisible()
+               for name in ("output-dock", "terminal-dock", "problems-dock", "changes-dock"))
+    if (project / "external").is_symlink():
+        link_index = window.fs_model.index(str(project / "external"))
+        assert not (window.fs_model.flags(link_index) & Qt.ItemIsEnabled)
+
+    window.preview_path(source)
+    editor = window.editor_tabs.currentWidget()
+    assert isinstance(editor, native_app.CodeEditor)
+    assert editor.toPlainText() == source.read_text(encoding="utf-8")
+    editor.setPlainText("print('saved')\n")
+    window.save_active_editor()
+    assert source.read_text(encoding="utf-8") == "print('saved')\n"
+    window.preview_path(outside_file)
+    assert window.editor_tabs.count() == 1
+    window.close()
+
+
+def test_agent_activity_is_expandable_and_keeps_command_logs_out_of_chat(app, monkeypatch, tmp_path):
+    monkeypatch.setattr(native_app, "request", lambda method, path, **kwargs: (
+        {"active_project": None, "recent_projects": []} if path == "/api/projects"
+        else {"active_project": str(tmp_path), "recent_projects": []} if path == "/api/projects/open"
+        else {"providers": []}))
+    window = native_app.LunaWindow(native_app.Backend())
+    window.backend.stop = lambda: None
+    window.on_event("tool", "Started read_file")
+    window.on_event("tool", "Finished read_file")
+    window.on_event("command", "Command finished with exit code 0\nvisible output")
+
+    assert window.activity.topLevelItemCount() == 2
+    assert window.activity.topLevelItem(0).child(0).text(0) == "Finished"
+    assert window.activity.topLevelItem(1).child(0).text(0) == "visible output"
+    assert "visible output" not in window.transcript.toPlainText()
     window.close()
 
 

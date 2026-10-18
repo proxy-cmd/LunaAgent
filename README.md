@@ -12,7 +12,7 @@ Python 3.11 or newer is required. In PowerShell, from this folder, run:
 
 Open http://127.0.0.1:8765. First-run settings use Apinex (`https://api.apinex.bond/v1`), model `free/gpt-6-luna`, and Chat Completions. Enter a key, choose **Test Connection**, save the provider, then finish setup. Settings, skills, automation setup, help, and diagnostics remain available if AI is offline.
 
-## Native desktop app (preview)
+## Native desktop app
 
 The desktop client uses PySide6 Qt Widgets and the same local FastAPI process,
 provider configuration, permissions, task database, and agent runtime as the
@@ -25,14 +25,15 @@ browser edition. From PowerShell, run:
 The script creates or uses the project `.venv` and installs
 `requirements-desktop.txt` there. The desktop app starts or connects to the
 local service on `127.0.0.1:8765`; it does not open a browser. Use **Open
-Project** or Ctrl+O to open a native Windows folder picker. Ctrl+N focuses the
-task composer, Ctrl+Enter submits, and Ctrl+H opens saved task history. Provider
-settings, connection testing, recent projects, file and content search,
-read-only file preview, live task events, cancellation, task history/recovery,
-diff restore, and native automation controls are available in panels and dialogs.
+Project** or Ctrl+O to open a native Windows folder picker. The window contains
+a searchable project explorer, embedded syntax-highlighted editor, Luna Agent
+conversation, resizable split panes, and collapsible Terminal, Output, Problems,
+and Changes panels. Ctrl+Enter submits a task and Ctrl+H opens saved task
+history. Open files in the editor with a double-click, save with Ctrl+S, and
+review or restore task diffs in the Changes panel.
 
-The toolbar permission selector maps directly to the backend's supported modes:
-Restricted (read-only) and Workspace (edits and approved actions). The backend
+The toolbar and composer permission selectors map directly to the backend's
+supported modes: Read only and Workspace (edits and approved actions). The backend
 does not implement Trusted Full Access. Provider API keys are entered into a
 masked native field and stored through the existing local provider mechanism.
 The native integrations view manages skills and MCP servers and provides
@@ -106,7 +107,7 @@ For accepted content, the `write_file` tool encodes the supplied text as UTF-8 w
 
 The agent streams provider text and task events to the page with Server-Sent Events. Chat Completions and Responses tool calls use the same bounded workspace tools. Interrupted tasks can be resumed from the beginning only when no tool started before the interruption; resume defaults to read-only. Task history and events are stored in `.luna/history.sqlite3`.
 
-Commands outside the narrow test/build/Git-inspection allowlist pause for approval. Approved PowerShell commands still run as the current Windows user and are not OS-sandboxed. The application does not authenticate other local processes running as the same user.
+Every agent-generated PowerShell command pauses for approval. Approved commands run with the current Windows user's permissions, are not sandboxed to the project, and may access other files or change system state. The approval prompt shows the exact command and this limitation. The application does not authenticate other local processes running as the same user.
 
 ## Skills
 

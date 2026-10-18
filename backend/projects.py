@@ -5,12 +5,12 @@ from __future__ import annotations
 import json
 import os
 import re
-import subprocess
 from pathlib import Path
 
 from fastapi import HTTPException
 
 from backend import providers
+from backend.workspace_paths import is_link_or_junction
 
 SETTINGS_FILE = providers.DATA_DIR / "settings.json"
 RECENT_LIMIT = 12
@@ -95,20 +95,72 @@ def project_status() -> dict:
             "recent_projects": data["recent_projects"]}
 
 
+def git_branch(root: Path) -> str:
+    """Read a local branch name without invoking Git or following repository links."""
+    git_dir = root / ".git"
+    if not git_dir.is_dir() or is_link_or_junction(git_dir):
+        return ""
+
+    def read_git_file(path: Path) -> str:
+        try:
+            path.resolve(strict=True).relative_to(git_dir.resolve(strict=True))
+            current = git_dir
+            for part in path.relative_to(git_dir).parts:
+                current = current / part
+                if is_link_or_junction(current):
+                    return ""
+            return path.read_text(encoding="utf-8").strip()
+        except (OSError, RuntimeError, ValueError, UnicodeError):
+            return ""
+
+    head = read_git_file(git_dir / "HEAD")
+    if not head.startswith("ref: refs/heads/"):
+        return "(detached HEAD)" if head else ""
+    reference = head[5:]
+    branch = reference.removeprefix("refs/heads/")
+    if not branch or any(part in {"", ".", ".."} for part in Path(reference).parts):
+        return ""
+    value = read_git_file(git_dir / Path(reference))
+    if value:
+        return branch
+    packed = read_git_file(git_dir / "packed-refs")
+    if any(line.split(" ", 1)[-1] == reference for line in packed.splitlines()
+           if line and not line.startswith(("#", "^"))):
+        return branch
+    return ""
+
+
 def inspect_project(value: str) -> dict:
     root = resolve_project(value)
+
+    def safe_path(path: Path) -> bool:
+        try:
+            path.resolve(strict=True).relative_to(root)
+        except (OSError, RuntimeError, ValueError):
+            return False
+        current = root
+        for part in path.relative_to(root).parts:
+            current = current / part
+            if is_link_or_junction(current):
+                return False
+        return True
+
     files = []
     for pattern in MANIFESTS:
         files.extend(root.glob(pattern))
-    manifests = sorted({path.name for path in files if path.is_file()})
+    manifests = sorted({path.name for path in files if path.is_file() and safe_path(path)})
 
     extensions: dict[str, int] = {}
     scanned = 0
     ignored = {".git", ".luna", ".venv", "venv", "node_modules", "__pycache__",
                "target", "dist", "build"}
     for directory, names, filenames in os.walk(root, followlinks=False):
-        names[:] = [name for name in names if name.lower() not in ignored]
+        current = Path(directory)
+        names[:] = [name for name in names if name.lower() not in ignored
+                    and not is_link_or_junction(current / name)]
         for filename in filenames:
+            if not safe_path(current / filename):
+                continue
             scanned += 1
             if scanned > 3000:
                 break
@@ -131,7 +183,7 @@ def inspect_project(value: str) -> dict:
     package_script_names = []
     dependencies = set()
     package_json = root / "package.json"
-    if package_json.is_file():
+    if package_json.is_file() and safe_path(package_json):
         try:
             package = json.loads(package_json.read_text(encoding="utf-8"))
             package_script_names = sorted(package.get("scripts", {}).keys())
@@ -144,7 +196,7 @@ def inspect_project(value: str) -> dict:
                         if name in dependencies)
     for manifest in ("requirements.txt", "pyproject.toml", "Pipfile"):
         candidate = root / manifest
-        if candidate.is_file() and candidate.stat().st_size < 100_000:
+        if candidate.is_file() and safe_path(candidate) and candidate.stat().st_size < 100_000:
             try:
                 text = candidate.read_text(encoding="utf-8").lower()
             except (OSError, UnicodeError):
@@ -154,14 +206,8 @@ def inspect_project(value: str) -> dict:
                     frameworks.append(framework)
     frameworks = sorted(set(frameworks))
 
-    git_status = None
-    if (root / ".git").exists():
-        try:
-            result = subprocess.run(["git", "-C", str(root), "status", "--short", "--branch"],
-                                    capture_output=True, text=True, timeout=4, check=False)
-            git_status = result.stdout[:4000] if result.returncode == 0 else "Git status unavailable."
-        except (OSError, subprocess.TimeoutExpired):
-            git_status = "Git status unavailable."
+    branch = git_branch(root)
+    git_status = f"Branch: {branch} (working tree status not checked)" if branch else None
 
     return {"path": str(root), "name": root.name, "languages": languages,
             "manifests": manifests[:50], "entry_points": entries,

@@ -348,8 +348,12 @@ def test_project_content_search_is_bounded_scoped_and_respects_ignores(tmp_path,
     (project / "too-large.txt").write_text("needle" * 100_000, encoding="utf-8")
     external = tmp_path / "outside.txt"
     external.write_text("needle outside", encoding="utf-8")
+    outside_dir = tmp_path / "outside-dir"
+    outside_dir.mkdir()
+    (outside_dir / "outside.py").write_text("needle outside directory", encoding="utf-8")
     try:
         (project / "link.txt").symlink_to(external)
+        (project / "linked-dir").symlink_to(outside_dir, target_is_directory=True)
     except OSError:
         pass
     client = TestClient(main.app)
@@ -411,6 +415,36 @@ def test_project_summary_reports_framework_without_returning_script_body(tmp_pat
     assert summary["frameworks"] == ["react"]
     assert summary["package_script_names"] == ["test"]
     assert "private-token-should-not-leak" not in str(summary)
+
+
+def test_project_summary_does_not_follow_symlinked_manifests_or_folders(tmp_path):
+    project = tmp_path / "selected"
+    outside = tmp_path / "other"
+    project.mkdir()
+    outside.mkdir()
+    (outside / "package.json").write_text(
+        '{"dependencies":{"private-framework":"1"}}', encoding="utf-8")
+    (outside / "secret.py").write_text("outside", encoding="utf-8")
+    try:
+        (project / "package.json").symlink_to(outside / "package.json")
+        (project / "linked-folder").symlink_to(outside, target_is_directory=True)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"Symlinks are unavailable: {exc}")
+
+    summary = projects.inspect_project(str(project))
+
+    assert "package.json" not in summary["manifests"]
+    assert summary["languages"] == []
+
+
+def test_git_branch_reader_uses_only_project_metadata(tmp_path):
+    project = tmp_path / "git-project"
+    git = project / ".git"
+    (git / "refs" / "heads").mkdir(parents=True)
+    (git / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+    (git / "refs" / "heads" / "main").write_text("deadbeef\n", encoding="utf-8")
+
+    assert projects.git_branch(project) == "main"
 
 
 def test_mock_agent_reads_writes_and_verifies_inside_active_project(tmp_path, monkeypatch):

@@ -588,7 +588,7 @@ def test_file_operations_reject_conflicts_paths_and_unapproved_actions(tmp_path,
     assert "denied" in denied.lower()
     outside = asyncio.run(main._run_tool("delete_path", {"path": "../outside"},
         project, "workspace", task_id=task_id))
-    assert "outside" in outside.lower()
+    assert "selected project" in outside.lower()
     assert (project / "exists.txt").exists()
 
 
@@ -631,6 +631,48 @@ def test_move_restore_removes_only_verified_duplicate(tmp_path, monkeypatch):
     assert blocked.status_code == 409
     assert second.read_text(encoding="utf-8") == "changed"
     assert duplicate.read_text(encoding="utf-8") == "original"
+
+
+def test_restore_rejects_paths_through_symlinks(tmp_path, monkeypatch):
+    isolate(tmp_path, monkeypatch)
+    project = tmp_path / "project"
+    outside = tmp_path / "outside"
+    project.mkdir()
+    outside.mkdir()
+    secret = outside / "secret.txt"
+    secret.write_text("keep me", encoding="utf-8")
+    try:
+        (project / "escape").symlink_to(outside, target_is_directory=True)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"Symlinks are unavailable: {exc}")
+    projects.open_project(str(project))
+    task_id = main._create_task(main.TaskInput(message="restore", mode="workspace"))
+    change_id = main._save_operation(task_id, "escape/secret.txt", "delete", b"before")
+    db = main._db()
+    db.execute("UPDATE file_changes SET status='applied' WHERE id=?", (change_id,))
+    db.commit()
+    db.close()
+
+    response = TestClient(main.app).post(f"/api/changes/{change_id}/restore")
+
+    assert response.status_code == 409
+    assert secret.read_text(encoding="utf-8") == "keep me"
+
+
+def test_task_diffs_are_scoped_to_the_active_project(tmp_path, monkeypatch):
+    isolate(tmp_path, monkeypatch)
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    projects.open_project(str(first))
+    task_id = main._create_task(main.TaskInput(message="change", mode="workspace"))
+    main._save_operation(task_id, "private.py", "write", b"private diff")
+    projects.open_project(str(second))
+
+    response = TestClient(main.app).get(f"/api/tasks/{task_id}/changes")
+
+    assert response.status_code == 409
 
 
 def test_interrupted_task_resumes_only_when_no_tool_started(tmp_path, monkeypatch):
@@ -924,6 +966,7 @@ def test_desktop_automation_requires_enable_and_checks_selected_controls(tmp_pat
 
 def test_terminal_event_contains_actual_command_output(monkeypatch, tmp_path):
     events = []
+    approvals = []
 
     class Process:
         pid = 101
@@ -935,10 +978,126 @@ def test_terminal_event_contains_actual_command_output(monkeypatch, tmp_path):
     async def create_process(*args, **kwargs):
         return Process()
 
+    async def approve(task_id, description, cancel_event):
+        approvals.append((task_id, description))
+        return True
+
     monkeypatch.setattr(main.asyncio, "create_subprocess_exec", create_process)
-    monkeypatch.setattr(main, "_command_needs_approval", lambda _: False)
+    monkeypatch.setattr(main, "_request_approval", approve)
     monkeypatch.setattr(main, "_task_event", lambda task_id, kind, detail: events.append((task_id, kind, detail)))
     result = asyncio.run(main._run_tool("run_command", {"command": "Get-ChildItem"},
                                         tmp_path, "workspace", task_id=99))
     assert json.loads(result) == {"exit_code": 3, "output": "real command output\n"}
+    assert approvals[0][0] == 99
+    assert "not sandboxed to the project" in approvals[0][1]
+    assert "Get-ChildItem" in approvals[0][1]
     assert events == [(99, "command", "Command finished with exit code 3\nreal command output\n")]
+
+
+@pytest.mark.parametrize("tool,args", [
+    ("list_files", {"path": "../outside"}),
+    ("read_file", {"path": "../outside/secret.txt"}),
+    ("search_files", {"path": "../outside", "query": "secret"}),
+    ("write_file", {"path": "../outside/secret.txt", "content": "changed", "expected_sha256": None}),
+    ("move_path", {"source": "../outside/secret.txt", "destination": "inside.txt"}),
+    ("move_path", {"source": "inside.txt", "destination": "../outside/moved.txt"}),
+    ("delete_path", {"path": "../outside/secret.txt"}),
+])
+def test_workspace_tools_reject_parent_traversal(tool, args, tmp_path):
+    root = tmp_path / "project"
+    outside = tmp_path / "outside"
+    root.mkdir()
+    outside.mkdir()
+    secret = outside / "secret.txt"
+    secret.write_text("keep me", encoding="utf-8")
+    (root / "inside.txt").write_text("inside", encoding="utf-8")
+
+    result = asyncio.run(main._run_tool(tool, args, root, "workspace", task_id=1))
+
+    assert "relative to the selected project" in result
+    assert secret.read_text(encoding="utf-8") == "keep me"
+    assert not (outside / "moved.txt").exists()
+
+
+@pytest.mark.parametrize("tool,args", [
+    ("list_files", None),
+    ("read_file", None),
+    ("search_files", {"query": "secret"}),
+    ("write_file", {"content": "changed", "expected_sha256": None}),
+    ("move_path", {"destination": "inside.txt"}),
+    ("delete_path", None),
+])
+def test_workspace_tools_reject_absolute_paths(tool, args, tmp_path):
+    root = tmp_path / "project"
+    outside = tmp_path / "outside"
+    root.mkdir()
+    outside.mkdir()
+    secret = outside / "secret.txt"
+    secret.write_text("keep me", encoding="utf-8")
+    arguments = dict(args or {})
+    if tool == "move_path":
+        arguments["source"] = str(secret)
+    else:
+        arguments["path"] = str(secret)
+    if tool == "search_files":
+        arguments["path"] = str(outside)
+    if tool == "list_files":
+        arguments["path"] = str(outside)
+
+    result = asyncio.run(main._run_tool(tool, arguments, root, "workspace", task_id=1))
+
+    assert "relative to the selected project" in result
+    assert secret.read_text(encoding="utf-8") == "keep me"
+
+
+@pytest.mark.parametrize("tool,args", [
+    ("list_files", {"path": "escape"}),
+    ("read_file", {"path": "escape/secret.txt"}),
+    ("search_files", {"path": "escape", "query": "secret"}),
+    ("write_file", {"path": "escape/secret.txt", "content": "changed", "expected_sha256": None}),
+    ("move_path", {"source": "escape/secret.txt", "destination": "inside.txt"}),
+    ("delete_path", {"path": "escape/secret.txt"}),
+])
+def test_workspace_tools_reject_symlink_escapes(tool, args, tmp_path):
+    root = tmp_path / "project"
+    outside = tmp_path / "outside"
+    root.mkdir()
+    outside.mkdir()
+    secret = outside / "secret.txt"
+    secret.write_text("keep me", encoding="utf-8")
+    try:
+        (root / "escape").symlink_to(outside, target_is_directory=True)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"Symlinks are unavailable: {exc}")
+
+    result = asyncio.run(main._run_tool(tool, args, root, "workspace", task_id=1))
+
+    assert ("symlinks or junctions" in result
+            or "outside the selected workspace" in result)
+    assert secret.read_text(encoding="utf-8") == "keep me"
+
+
+def test_workspace_search_skips_nested_symlinked_directories(tmp_path):
+    root = tmp_path / "project"
+    outside = tmp_path / "outside"
+    root.mkdir()
+    outside.mkdir()
+    (outside / "secret.txt").write_text("needle outside", encoding="utf-8")
+    try:
+        (root / "escape").symlink_to(outside, target_is_directory=True)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"Symlinks are unavailable: {exc}")
+
+    result = asyncio.run(main._run_tool("search_files", {
+        "path": ".", "query": "needle"}, root, "read_only"))
+
+    assert json.loads(result) == []
+
+
+def test_workspace_target_rejects_absolute_and_traversal_paths(tmp_path):
+    root = tmp_path / "project"
+    root.mkdir()
+    with pytest.raises(ValueError, match="relative to the selected project"):
+        main._target(root, str(root / "file.txt"))
+    with pytest.raises(ValueError, match="relative to the selected project"):
+        main._target(root, "child/../file.txt")

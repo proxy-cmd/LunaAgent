@@ -13,15 +13,18 @@ import re
 
 import httpx
 from PySide6.QtCore import QDir, QLockFile, QSettings, QSortFilterProxyModel, QThread, QTimer, Qt, Signal
-from PySide6.QtGui import QAction, QFont, QPixmap
+from PySide6.QtGui import QAction, QColor, QFont, QPainter, QPixmap, QSyntaxHighlighter, QTextCharFormat
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFileSystemModel,
     QCheckBox, QDoubleSpinBox, QFormLayout, QHBoxLayout, QLabel, QLineEdit,
     QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
     QPlainTextEdit, QPushButton, QSplitter, QStatusBar,
     QSpinBox, QTreeView, QVBoxLayout, QWidget, QDockWidget, QInputDialog, QTabWidget,
+    QToolButton, QStyle,
+    QTreeWidget, QTreeWidgetItem,
 )
-from backend import providers
+from backend import projects, providers
+from backend.workspace_paths import is_link_or_junction
 
 BASE_URL = "http://127.0.0.1:8765"
 ROOT = Path(__file__).resolve().parents[1]
@@ -156,6 +159,130 @@ class TaskComposer(QPlainTextEdit):
             self.submitRequested.emit()
             return
         super().keyPressEvent(event)
+
+
+class CodeHighlighter(QSyntaxHighlighter):
+    """Small language-aware highlighter for the built-in Qt code editor."""
+    def __init__(self, document):
+        super().__init__(document)
+        self.rules = []
+        keyword = QTextCharFormat()
+        keyword.setForeground(QColor("#b9a6ff"))
+        keyword.setFontWeight(QFont.DemiBold)
+        self.rules.append((re.compile(r"\b(class|def|return|if|else|elif|for|while|in|import|from|as|try|except|finally|with|async|await|pass|raise|yield|const|let|var|function|export|default|new|public|private|static|void|int|string|using|namespace)\b"), keyword))
+        string = QTextCharFormat()
+        string.setForeground(QColor("#a8c88a"))
+        self.rules.append((re.compile(r"(['\"].*?['\"]|`.*?`)"), string))
+        comment = QTextCharFormat()
+        comment.setForeground(QColor("#777e88"))
+        self.rules.append((re.compile(r"(#.*$|//.*$)"), comment))
+        number = QTextCharFormat()
+        number.setForeground(QColor("#d7a879"))
+        self.rules.append((re.compile(r"\b\d+(?:\.\d+)?\b"), number))
+
+    def highlightBlock(self, text):
+        for pattern, style in self.rules:
+            for match in pattern.finditer(text):
+                self.setFormat(match.start(), match.end() - match.start(), style)
+
+
+class CodeEditor(QPlainTextEdit):
+    """Lightweight Qt Widgets editor with line numbers and syntax colors."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFont(QFont("Cascadia Code", 10))
+        self.setLineWrapMode(QPlainTextEdit.NoWrap)
+        self.setTabStopDistance(self.fontMetrics().horizontalAdvance(" ") * 4)
+        self.setStyleSheet("QPlainTextEdit { background:#17191f; border:0; padding:8px; selection-background-color:#453d72; }")
+        self.highlighter = CodeHighlighter(self.document())
+        self.blockCountChanged.connect(self._update_margin)
+        self.updateRequest.connect(self._update_numbers)
+        self._update_margin()
+
+    def _margin_width(self):
+        digits = len(str(max(1, self.blockCount())))
+        return 16 + self.fontMetrics().horizontalAdvance("9") * digits
+
+    def _update_margin(self, *_):
+        self.setViewportMargins(self._margin_width(), 0, 0, 0)
+
+    def _update_numbers(self, rect, dy):
+        if dy:
+            self.viewport().scroll(0, dy)
+        else:
+            self.viewport().update(0, rect.y(), self._margin_width(), rect.height())
+        if rect.contains(self.viewport().rect()):
+            self._update_margin()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._update_margin()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        painter = QPainter(self.viewport())
+        painter.fillRect(0, event.rect().y(), self._margin_width(), event.rect().height(), QColor("#1b1d23"))
+        block = self.firstVisibleBlock()
+        number = block.blockNumber()
+        top = round(self.blockBoundingGeometry(block).translated(self.contentOffset()).top())
+        bottom = top + round(self.blockBoundingRect(block).height())
+        while block.isValid() and top <= event.rect().bottom():
+            if block.isVisible() and bottom >= event.rect().top():
+                painter.setPen(QColor("#737985"))
+                painter.drawText(0, top, self._margin_width() - 6, self.fontMetrics().height(),
+                                 Qt.AlignRight, str(number + 1))
+            block = block.next()
+            top = bottom
+            bottom = top + round(self.blockBoundingRect(block).height())
+            number += 1
+
+
+class EditorTabWidget(QTabWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setTabsClosable(True)
+        self.setMovable(True)
+        self.setDocumentMode(True)
+        self.file_paths: dict[QWidget, Path] = {}
+        self.workspace: Path | None = None
+        self.tabCloseRequested.connect(self.close_tab)
+
+    def close_tab(self, index):
+        widget = self.widget(index)
+        if widget.document().isModified():
+            answer = QMessageBox.question(self, "Unsaved file", "Save changes before closing this file?",
+                                          QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
+                                          QMessageBox.Save)
+            if answer == QMessageBox.Cancel:
+                return
+            if answer == QMessageBox.Save and not self.save_editor(widget):
+                return
+        self.removeTab(index)
+        self.file_paths.pop(widget, None)
+        widget.deleteLater()
+
+    def save_editor(self, editor):
+        path = self.file_paths.get(editor)
+        if not path or not self.workspace:
+            return False
+        try:
+            resolved = path.resolve(strict=True)
+            resolved.relative_to(self.workspace.resolve(strict=True))
+            if _protected_preview_path(path, self.workspace):
+                raise ValueError("The file is outside the active workspace or is protected.")
+            path.write_text(editor.toPlainText(), encoding="utf-8", newline="")
+            editor.document().setModified(False)
+            self._update_title(editor)
+            return True
+        except (OSError, ValueError, RuntimeError) as exc:
+            QMessageBox.warning(self, "Could not save file", str(exc))
+            return False
+
+    def _update_title(self, editor):
+        index = self.indexOf(editor)
+        if index >= 0:
+            title = self.file_paths[editor].name
+            self.setTabText(index, ("● " if editor.document().isModified() else "") + title)
 
 
 class TerminalWorker(QThread):
@@ -480,9 +607,25 @@ class ChangedFileSystemModel(QFileSystemModel):
                 return f"{value}  [{label}]"
         return value
 
+    def flags(self, index):
+        flags = super().flags(index)
+        if index.isValid():
+            path = Path(self.filePath(index))
+            if is_link_or_junction(path):
+                return flags & ~Qt.ItemIsEnabled
+        return flags
+
 
 def _protected_preview_path(path: Path, root: Path) -> bool:
     try:
+        lexical_root = root.absolute()
+        lexical_path = path.absolute()
+        lexical_relative = lexical_path.relative_to(lexical_root)
+        current = lexical_root
+        for part in lexical_relative.parts:
+            current = current / part
+            if is_link_or_junction(current):
+                return True
         relative = path.resolve().relative_to(root.resolve())
     except (OSError, RuntimeError, ValueError):
         return True
@@ -510,53 +653,64 @@ class LunaWindow(QMainWindow):
         geometry = self.settings.value("window/geometry")
         if geometry:
             self.restoreGeometry(geometry)
+        state = self.settings.value("window/state")
+        if state:
+            self.restoreState(state)
+        saved_split = self.settings.value("workspace/split")
+        if saved_split:
+            self.findChild(QSplitter, "workspace-splitter").setSizes([int(value) for value in saved_split])
+        saved_chat_split = self.settings.value("workspace/chat_split")
+        if saved_chat_split:
+            self.findChild(QSplitter, "editor-agent-splitter").setSizes([int(value) for value in saved_chat_split])
         self.refresh_projects()
         self.refresh_provider()
 
     def _build(self):
         self.setStyleSheet("""
-            QMainWindow, QWidget { background:#17181e; color:#e7e7ed; }
-            QLineEdit, QPlainTextEdit, QTreeView, QComboBox { background:#20212a; border:1px solid #343641; border-radius:6px; padding:7px; selection-background-color:#665bd6; }
-            QPushButton { background:#282a34; border:1px solid #3a3c47; border-radius:6px; padding:8px 13px; }
-            QPushButton:hover { border-color:#8e83fa; } QPushButton:disabled { color:#777; }
-            QDockWidget::title { background:#20212a; padding:7px; }
-            QStatusBar { background:#20212a; }
+            QMainWindow, QWidget { background:#17191f; color:#dedee6; font-family:'Segoe UI'; font-size:9pt; }
+            QLineEdit, QPlainTextEdit, QTreeView, QComboBox { background:#202229; border:1px solid #30323a; border-radius:4px; padding:6px; selection-background-color:#51458a; }
+            QPushButton { background:#252730; border:1px solid #343640; border-radius:4px; padding:6px 11px; }
+            QPushButton:hover { background:#2c2e38; } QPushButton:disabled { color:#777; }
+            QToolBar { background:#1b1d23; border:0; spacing:8px; padding:4px 8px; }
+            QToolBar QComboBox { padding:4px 7px; }
+            QDockWidget::title { background:#1d1f26; padding:6px 9px; border-top:1px solid #30323a; }
+            QTabWidget::pane { border:1px solid #30323a; }
+            QTabBar::tab { background:#1d1f26; padding:7px 12px; border-right:1px solid #30323a; }
+            QTabBar::tab:selected { background:#252730; border-top:2px solid #8878d5; }
+            QStatusBar { background:#1d1f26; border-top:1px solid #30323a; }
         """)
         bar = self.addToolBar("Main")
         bar.setMovable(False)
+        bar.setObjectName("main-toolbar")
         open_action = QAction("Open Project", self)
         open_action.setShortcut("Ctrl+O")
         open_action.triggered.connect(self.choose_project)
         bar.addAction(open_action)
-        history_action = QAction("Task history", self)
+        history_action = QAction("History", self)
         history_action.setShortcut("Ctrl+H")
         history_action.triggered.connect(self.show_history)
         bar.addAction(history_action)
-        settings_action = QAction("Providers", self)
+        settings_action = QAction("Settings", self)
         settings_action.triggered.connect(self.show_provider_settings)
         bar.addAction(settings_action)
-        integrations_action = QAction("Skills / MCP / Automation", self)
+        integrations_action = QAction("Integrations", self)
         integrations_action.triggered.connect(self.show_integrations_settings)
         bar.addAction(integrations_action)
-        new_action = QAction("New Task", self)
-        new_action.setShortcut("Ctrl+N")
-        new_action.triggered.connect(lambda: self.composer.setFocus())
-        bar.addAction(new_action)
         bar.addSeparator()
-        bar.addWidget(QLabel("  Project: "))
-        self.project_label = QLabel("No project selected")
+        self.project_label = QLabel("No project")
         bar.addWidget(self.project_label)
-        bar.addSeparator()
-        bar.addWidget(QLabel("  Permission: "))
+        bar.addWidget(QLabel("Permission"))
         self.mode = QComboBox()
-        self.mode.addItem("Restricted · read only", "read_only")
-        self.mode.addItem("Workspace · edits allowed", "workspace")
+        self.mode.addItem("Read only", "read_only")
+        self.mode.addItem("Workspace", "workspace")
         self.mode.currentIndexChanged.connect(self.persist_mode)
-        bar.addWidget(self.mode)
         saved_mode = self.settings.value("permission/mode", "read_only")
         self.mode.setCurrentIndex(max(0, self.mode.findData(saved_mode)))
+        self.provider_label = QLabel("Checking provider?")
+        bar.addWidget(self.provider_label)
 
         split = QSplitter(Qt.Horizontal)
+        split.setObjectName("workspace-splitter")
         self.files = QTreeView()
         self.fs_model = ChangedFileSystemModel(self)
         self.fs_model.setReadOnly(True)
@@ -568,76 +722,178 @@ class LunaWindow(QMainWindow):
         self.fs_proxy.setFilterCaseSensitivity(Qt.CaseInsensitive)
         self.files.setModel(self.fs_proxy)
         self.files.setColumnWidth(0, 240)
+        self.files.setHeaderHidden(True)
+        self.files.setIndentation(14)
         self.files.doubleClicked.connect(self.preview_file)
         left = QWidget()
-        left_layout = QVBoxLayout(left)
-        left_layout.setContentsMargins(8, 8, 8, 8)
-        left_layout.addWidget(QLabel("PROJECT FILES"))
+        left_layout = QHBoxLayout(left)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        activity_rail = QWidget()
+        activity_rail.setFixedWidth(38)
+        activity_layout = QVBoxLayout(activity_rail)
+        activity_layout.setContentsMargins(3, 6, 3, 6)
+        explorer_button = QToolButton()
+        explorer_button.setIcon(self.style().standardIcon(QStyle.SP_DirOpenIcon))
+        explorer_button.setToolTip("Explorer")
+        explorer_button.clicked.connect(self.files.setFocus)
+        search_button = QToolButton()
+        search_button.setIcon(self.style().standardIcon(QStyle.SP_FileDialogContentsView))
+        search_button.setToolTip("Search in project")
+        search_button.clicked.connect(lambda: self.content_search.setFocus())
+        changes_button = QToolButton()
+        changes_button.setIcon(self.style().standardIcon(QStyle.SP_FileDialogDetailedView))
+        changes_button.setToolTip("Changes")
+        changes_button.clicked.connect(lambda: self.findChild(QDockWidget, "changes-dock").show())
+        for button in (explorer_button, search_button, changes_button):
+            button.setAutoRaise(True)
+            activity_layout.addWidget(button)
+        activity_layout.addStretch(1)
+        left_layout.addWidget(activity_rail)
+        explorer = QWidget()
+        explorer.setMinimumWidth(170)
+        explorer_layout = QVBoxLayout(explorer)
+        explorer_layout.setContentsMargins(8, 8, 8, 8)
+        left_layout.addWidget(explorer, 1)
+        left_layout = explorer_layout
+        left_layout.addWidget(QLabel("EXPLORER"))
         self.file_search = QLineEdit()
-        self.file_search.setPlaceholderText("Filter visible file names…")
+        self.file_search.setPlaceholderText("Search files")
         self.file_search.textChanged.connect(self.filter_tree)
         left_layout.addWidget(self.file_search)
         self.content_search = QLineEdit()
-        self.content_search.setPlaceholderText("Search file contents…")
+        self.content_search.setPlaceholderText("Search in project")
         self.content_search.returnPressed.connect(self.search_contents)
         left_layout.addWidget(self.content_search)
         left_layout.addWidget(self.files)
         self.recent = QComboBox()
         self.recent.currentIndexChanged.connect(self.open_recent)
-        left_layout.addWidget(self.recent)
-        split.addWidget(left)
+        self.recent.setMaximumHeight(30)
+        self.recent.setMinimumWidth(170)
+        bar.addWidget(self.recent)
 
-        center = QWidget()
-        layout = QVBoxLayout(center)
-        layout.setContentsMargins(14, 12, 14, 12)
-        self.project_path = QLabel("Choose a project folder to begin")
-        self.project_path.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        layout.addWidget(self.project_path)
+        self.breadcrumbs = QLabel("Open a project to begin")
+        self.breadcrumbs.setStyleSheet("padding:6px 12px; color:#9296a1; border-bottom:1px solid #30323a;")
+        self.editor_tabs = EditorTabWidget(self)
+        self.editor_tabs.workspace = None
+        empty_editor = CodeEditor(self)
+        empty_editor.setReadOnly(True)
+        empty_editor.setPlaceholderText("Open a file from the project explorer to edit it here.")
+        self.editor_tabs.addTab(empty_editor, "Welcome")
         self.transcript = QPlainTextEdit()
         self.transcript.setReadOnly(True)
         self.transcript.setFont(QFont("Cascadia Code", 10))
-        self.transcript.setPlaceholderText("Task messages and live agent events appear here.")
-        layout.addWidget(self.transcript, 1)
+        self.transcript.setPlaceholderText("Luna Agent responses and task summaries appear here.")
+        self.transcript.setStyleSheet("QPlainTextEdit { border:0; background:#191b21; padding:10px; }")
+        chat_split = QSplitter(Qt.Horizontal)
+        chat_split.setObjectName("editor-agent-splitter")
+        editor = QWidget()
+        editor_layout = QVBoxLayout(editor)
+        editor_layout.setContentsMargins(0, 0, 0, 0)
+        editor_layout.addWidget(self.breadcrumbs)
+        editor_layout.addWidget(self.editor_tabs)
+        chat_split.addWidget(editor)
+        chat = QWidget()
+        chat_layout = QVBoxLayout(chat)
+        chat_layout.setContentsMargins(0, 0, 0, 4)
+        chat_layout.addWidget(QLabel("LUNA AGENT"))
+        chat_layout.addWidget(self.transcript, 1)
         self.composer = TaskComposer()
-        self.composer.setMaximumHeight(125)
-        self.composer.setPlaceholderText("Describe the coding task…  (Ctrl+Enter to run)")
+        self.composer.setMinimumHeight(76)
+        self.composer.setMaximumHeight(140)
+        self.composer.setPlaceholderText("Ask Luna about this project?  (Ctrl+Enter to run)")
         self.composer.submitRequested.connect(self.run_task)
-        layout.addWidget(self.composer)
+        chat_layout.addWidget(self.composer)
         row = QHBoxLayout()
-        self.provider_label = QLabel("Checking provider…")
-        self.run_button = QPushButton("Run task")
+        self.run_button = QPushButton("Send")
         self.run_button.clicked.connect(self.run_task)
         self.stop_button = QPushButton("Stop")
         self.stop_button.setEnabled(False)
         self.stop_button.clicked.connect(self.stop_task)
-        row.addWidget(self.provider_label, 1)
+        self.composer_mode = QComboBox()
+        self.composer_mode.addItem("Read only", "read_only")
+        self.composer_mode.addItem("Workspace", "workspace")
+        self.composer_mode.setCurrentIndex(self.mode.currentIndex())
+        self.composer_mode.currentIndexChanged.connect(self.mode.setCurrentIndex)
+        self.mode.currentIndexChanged.connect(self.composer_mode.setCurrentIndex)
+        row.addWidget(self.composer_mode, 1)
         row.addWidget(self.run_button)
         row.addWidget(self.stop_button)
-        layout.addLayout(row)
-        split.addWidget(center)
-        split.setSizes([310, 900])
+        chat_layout.addLayout(row)
+        chat_split.addWidget(chat)
+        chat_split.setSizes([620, 320])
+        split.addWidget(left)
+        split.addWidget(chat_split)
+        split.setSizes([250, 1170])
         self.setCentralWidget(split)
 
-        self.activity = QPlainTextEdit()
-        self.activity.setReadOnly(True)
-        self.activity.setMaximumBlockCount(2500)
-        dock = QDockWidget("Tool activity · task events", self)
-        dock.setWidget(self.activity)
-        self.addDockWidget(Qt.BottomDockWidgetArea, dock)
+        self.activity = QTreeWidget()
+        self.activity.setColumnCount(1)
+        self.activity.setHeaderHidden(True)
+        self.activity.setWordWrap(True)
+        self.activity.setStyleSheet("QTreeWidget { border:0; background:#191b21; }")
+        self.tool_activity_items = {}
+        output_dock = QDockWidget("Output", self)
+        output_dock.setObjectName("output-dock")
+        output_dock.setWidget(self.activity)
+        self.addDockWidget(Qt.BottomDockWidgetArea, output_dock)
         self.terminal = InteractiveTerminal(self)
-        terminal_dock = QDockWidget("Manual PowerShell · current-user permissions", self)
+        terminal_dock = QDockWidget("Terminal", self)
+        terminal_dock.setObjectName("terminal-dock")
         terminal_dock.setWidget(self.terminal)
         self.addDockWidget(Qt.BottomDockWidgetArea, terminal_dock)
         self.changes_list = QListWidget()
-        changes_dock = QDockWidget("Latest task changes", self)
-        changes_dock.setWidget(self.changes_list)
+        self.changes_list.itemDoubleClicked.connect(lambda _item: self.open_selected_change())
+        changes_panel = QWidget()
+        changes_layout = QVBoxLayout(changes_panel)
+        changes_layout.setContentsMargins(6, 6, 6, 6)
+        changes_layout.addWidget(self.changes_list, 1)
+        changes_actions = QHBoxLayout()
+        open_diff = QPushButton("Open diff")
+        open_diff.clicked.connect(self.open_selected_change)
+        restore_change = QPushButton("Restore")
+        restore_change.clicked.connect(self.restore_selected_change)
+        changes_actions.addWidget(open_diff)
+        changes_actions.addWidget(restore_change)
+        changes_layout.addLayout(changes_actions)
+        changes_dock = QDockWidget("Changes", self)
+        changes_dock.setObjectName("changes-dock")
+        changes_dock.setWidget(changes_panel)
         self.addDockWidget(Qt.BottomDockWidgetArea, changes_dock)
+        self.problems_list = QListWidget()
+        problems_dock = QDockWidget("Problems", self)
+        problems_dock.setObjectName("problems-dock")
+        problems_dock.setWidget(self.problems_list)
+        self.addDockWidget(Qt.BottomDockWidgetArea, problems_dock)
+        self.tabifyDockWidget(output_dock, terminal_dock)
+        self.tabifyDockWidget(output_dock, problems_dock)
+        self.tabifyDockWidget(output_dock, changes_dock)
+        for dock in (output_dock, terminal_dock, problems_dock, changes_dock):
+            dock.hide()
+        view_menu = self.menuBar().addMenu("View")
+        for dock in (output_dock, terminal_dock, problems_dock, changes_dock):
+            view_menu.addAction(dock.toggleViewAction())
+
         self.status = QStatusBar()
         self.setStatusBar(self.status)
+        self.path_status = QLabel("No project")
+        self.branch_status = QLabel("")
+        self.permission_status = QLabel("Read only")
+        self.permission_status.setText("Workspace" if self.mode.currentData() == "workspace" else "Read only")
+        self.agent_status = QLabel("Ready")
+        self.provider_status = QLabel("Provider")
+        for label in (self.path_status, self.branch_status, self.permission_status,
+                      self.provider_status, self.agent_status):
+            self.status.addPermanentWidget(label)
         self.status.showMessage("Local Luna agent ready")
+        save_action = QAction("Save file", self)
+        save_action.setShortcut("Ctrl+S")
+        save_action.triggered.connect(self.save_active_editor)
+        self.addAction(save_action)
 
     def persist_mode(self):
         self.settings.setValue("permission/mode", self.mode.currentData())
+        if hasattr(self, "permission_status"):
+            self.permission_status.setText("Workspace" if self.mode.currentData() == "workspace" else "Read only")
 
     def choose_project(self):
         start = str(self.project or Path.home())
@@ -647,14 +903,41 @@ class LunaWindow(QMainWindow):
 
     def set_project(self, path: str):
         try:
-            info = request("POST", "/api/projects/open", json={"path": path})
+            requested = Path(path).expanduser().resolve(strict=True)
+            if self.project and requested != self.project.resolve():
+                dirty = [editor for editor in self.editor_tabs.file_paths
+                         if editor.document().isModified()]
+                if dirty:
+                    choice = QMessageBox.question(self, "Unsaved files",
+                        "Save changes before switching projects?",
+                        QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
+                        QMessageBox.Save)
+                    if choice == QMessageBox.Cancel:
+                        return
+                    if choice == QMessageBox.Save and not all(
+                            self.editor_tabs.save_editor(editor) for editor in dirty):
+                        return
+                while self.editor_tabs.count():
+                    widget = self.editor_tabs.widget(0)
+                    self.editor_tabs.removeTab(0)
+                    self.editor_tabs.file_paths.pop(widget, None)
+                    widget.deleteLater()
+                welcome = CodeEditor(self.editor_tabs)
+                welcome.setReadOnly(True)
+                welcome.setPlaceholderText("Open a file from the project explorer to edit it here.")
+                self.editor_tabs.addTab(welcome, "Welcome")
+            info = request("POST", "/api/projects/open", json={"path": str(requested)})
             self.project = Path(info["active_project"])
+            self.editor_tabs.workspace = self.project
             self.terminal.set_directory(self.project)
             self.fs_model.set_changed_paths({})
             self.changes_list.clear()
             self.project_label.setText(self.project.name)
             self.project_label.setToolTip(str(self.project))
-            self.project_path.setText(str(self.project))
+            self.breadcrumbs.setText(self.project.name + "  /  ")
+            self.path_status.setText(str(self.project))
+            self.path_status.setToolTip(str(self.project))
+            self.branch_status.setText(self._git_branch(self.project))
             self.fs_model.setRootPath(str(self.project))
             self.files.setRootIndex(self.fs_proxy.mapFromSource(self.fs_model.index(str(self.project))))
             self.settings.setValue("project/last", str(self.project))
@@ -689,8 +972,19 @@ class LunaWindow(QMainWindow):
             data = request("GET", "/api/providers")
             active = next((p for p in data["providers"] if p.get("is_default")), None)
             self.provider_label.setText((f"{active['name']} · {active['model']} · key configured" if active and active.get("key_configured") else "Provider setup needed · open browser settings"))
+            self.provider_status.setText(f"{active['name']} · {active['model']}" if active else "Provider not set")
         except Exception as exc:
             self.provider_label.setText(str(exc))
+            self.provider_status.setText("Provider unavailable")
+
+    def save_active_editor(self):
+        editor = self.editor_tabs.currentWidget()
+        if isinstance(editor, CodeEditor) and editor in self.editor_tabs.file_paths:
+            self.editor_tabs.save_editor(editor)
+
+    @staticmethod
+    def _git_branch(project: Path) -> str:
+        return projects.git_branch(project)
 
     def show_provider_settings(self):
         dialog = ProviderDialog(self)
@@ -721,7 +1015,9 @@ class LunaWindow(QMainWindow):
             QMessageBox.warning(self, "Task history", str(exc))
             return
         events = state.get("events", [])
-        event_text = "\n".join(f"{event['created']} [{event['kind']}] {event['detail']}" for event in events)
+        event_text = "\n".join(
+            f"{event['created']} [{event['kind']}] {event['detail'].splitlines()[0][:240]}"
+            for event in events)
         try:
             used_skills = request("GET", f"/api/tasks/{selected['id']}/skills").get("skills", [])
         except Exception:
@@ -854,9 +1150,49 @@ class LunaWindow(QMainWindow):
             if operation == "move" and change.get("destination"):
                 marked[str(self.project / change["destination"])] = "Moved here"
             target = change.get("destination") if operation == "move" else change["path"]
-            self.changes_list.addItem(f"{target} · {label} · task #{task_id}")
+            item = QListWidgetItem(f"{target} · {label} · task #{task_id}")
+            item.setData(Qt.UserRole, change)
+            self.changes_list.addItem(item)
+        if changes:
+            self.findChild(QDockWidget, "changes-dock").show()
         self.fs_model.set_changed_paths(marked)
         self.files.viewport().update()
+
+    def open_selected_change(self, *_):
+        item = self.changes_list.currentItem()
+        change = item.data(Qt.UserRole) if item else None
+        if not change:
+            return
+        title = change.get("path", "Change") + " diff"
+        for index in range(self.editor_tabs.count()):
+            if self.editor_tabs.tabText(index).removeprefix("● ") == title:
+                self.editor_tabs.setCurrentIndex(index)
+                return
+        diff = CodeEditor(self.editor_tabs)
+        diff.setReadOnly(True)
+        diff.setPlainText(change.get("diff") or "No textual diff is available.")
+        self.editor_tabs.addTab(diff, title)
+        self.editor_tabs.setCurrentWidget(diff)
+        self.breadcrumbs.setText(title)
+
+    def restore_selected_change(self):
+        item = self.changes_list.currentItem()
+        change = item.data(Qt.UserRole) if item else None
+        if not change or change.get("status") != "applied":
+            return
+        answer = QMessageBox.question(self, "Restore change",
+            f"Restore {change['path']} to its pre-task contents?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if answer != QMessageBox.Yes:
+            return
+        try:
+            request("POST", f"/api/changes/{change['id']}/restore")
+            change["status"] = "restored"
+            item.setText(item.text().replace("Added", "Restored").replace("Modified", "Restored")
+                         .replace("Deleted", "Restored").replace("Moved", "Restored"))
+            self.status.showMessage(f"Restored {change['path']}", 5000)
+        except Exception as exc:
+            QMessageBox.warning(self, "Restore failed", str(exc))
 
     def filter_tree(self, value: str):
         self.fs_proxy.setFilterFixedString(value)
@@ -888,23 +1224,42 @@ class LunaWindow(QMainWindow):
         except (OSError, ValueError, RuntimeError):
             self.status.showMessage("Preview is limited to files inside the active project.", 5000)
             return
-        if path.is_symlink() or not resolved.is_file() or resolved.stat().st_size > 1_000_000:
+        if is_link_or_junction(path) or not resolved.is_file() or resolved.stat().st_size > 1_000_000:
             return
         try:
             text = resolved.read_text(encoding="utf-8")
         except (OSError, UnicodeError):
             self.status.showMessage("This file is not readable UTF-8 text.", 5000)
             return
-        preview = QMainWindow(self)
-        preview.setWindowTitle(str(resolved))
-        preview.resize(800, 600)
-        view = QPlainTextEdit(preview)
-        view.setReadOnly(True)
-        view.setPlainText(text)
-        view.setFont(QFont("Cascadia Code", 10))
-        preview.setCentralWidget(view)
-        preview.show()
-        self._preview = preview
+        for index in range(self.editor_tabs.count()):
+            editor = self.editor_tabs.widget(index)
+            if self.editor_tabs.file_paths.get(editor) == resolved:
+                self.editor_tabs.setCurrentIndex(index)
+                return
+        welcome = self.editor_tabs.widget(0)
+        if self.editor_tabs.count() == 1 and welcome not in self.editor_tabs.file_paths:
+            self.editor_tabs.removeTab(0)
+            welcome.deleteLater()
+        editor = CodeEditor(self.editor_tabs)
+        editor.setPlainText(text)
+        editor.document().setModified(False)
+        self.editor_tabs.file_paths[editor] = resolved
+        index = self.editor_tabs.addTab(editor, resolved.name)
+        editor.document().modificationChanged.connect(lambda _dirty, item=editor: self.editor_tabs._update_title(item))
+        editor.cursorPositionChanged.connect(lambda item=editor: self._update_breadcrumb(item))
+        self.editor_tabs.setCurrentIndex(index)
+        self._update_breadcrumb(editor)
+
+    def _update_breadcrumb(self, editor):
+        path = self.editor_tabs.file_paths.get(editor)
+        if not path or not self.project:
+            return
+        try:
+            relative = path.relative_to(self.project)
+        except ValueError:
+            return
+        cursor = editor.textCursor()
+        self.breadcrumbs.setText(f"{self.project.name}  /  {relative.as_posix()}   Ln {cursor.blockNumber() + 1}, Col {cursor.positionInBlock() + 1}")
 
     def run_task(self):
         message = self.composer.toPlainText().strip()
@@ -928,6 +1283,7 @@ class LunaWindow(QMainWindow):
         self.worker.finished_task.connect(self.on_finished)
         self.worker.failed.connect(self.on_failed)
         self.worker.start()
+        self.agent_status.setText("Working")
         self.status.showMessage("Task running…")
 
     def on_event(self, kind: str, detail: str):
@@ -937,19 +1293,43 @@ class LunaWindow(QMainWindow):
             cursor.insertText(detail)
             self.transcript.setTextCursor(cursor)
         else:
-            self.activity.appendPlainText(f"[{kind}] {detail}")
-            if kind == "command":
-                self.terminal.output.appendPlainText("[agent command result] " + detail)
-            if kind in ("tool", "command", "approval", "error", "status"):
-                self.transcript.appendPlainText(f"[{kind}] {detail}")
+            summary = (detail.splitlines()[0] if detail.splitlines() else kind)[:240]
+            if kind == "tool":
+                action, _, name = summary.partition(" ")
+                if action == "Started":
+                    item = QTreeWidgetItem([name or summary])
+                    item.addChild(QTreeWidgetItem(["Running…"]))
+                    self.activity.addTopLevelItem(item)
+                    self.tool_activity_items[name] = item
+                elif action == "Finished" and name in self.tool_activity_items:
+                    parent = self.tool_activity_items.pop(name)
+                    parent.child(0).setText(0, "Finished")
+                else:
+                    self.activity.addTopLevelItem(QTreeWidgetItem([summary]))
+            elif kind == "command":
+                item = QTreeWidgetItem([summary])
+                output = detail.partition("\n")[2]
+                if output:
+                    item.addChild(QTreeWidgetItem([output[:20_000]]))
+                self.activity.addTopLevelItem(item)
+            else:
+                self.activity.addTopLevelItem(QTreeWidgetItem([f"{kind}: {summary}"]))
+            if self.activity.topLevelItemCount() > 2500:
+                self.activity.takeTopLevelItem(0)
+            if kind in ("tool", "command"):
+                self.findChild(QDockWidget, "output-dock").show()
+            if kind in ("approval", "error", "status"):
+                self.transcript.appendPlainText(f"[{kind}] {summary}")
+            elif kind == "tool":
+                self.transcript.appendPlainText(f"Working: {summary}")
 
     def confirm_approval(self, approval: dict):
         command = str(approval.get("command", "Sensitive action"))
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Warning)
         box.setWindowTitle("Action approval required")
-        box.setText("The shared agent backend paused before this sensitive action.")
-        box.setInformativeText("Review the target below. Approved PowerShell commands run with your Windows account permissions.")
+        box.setText("Luna is waiting for approval.")
+        box.setInformativeText("PowerShell commands use your Windows account and are not sandboxed to the project.")
         box.setDetailedText(command)
         approve = box.addButton("Approve", QMessageBox.AcceptRole)
         deny = box.addButton("Deny", QMessageBox.RejectRole)
@@ -966,15 +1346,16 @@ class LunaWindow(QMainWindow):
     def on_finished(self, state: dict):
         self.transcript.appendPlainText(f"\nTask {state.get('status', 'finished')}.")
         self.status.showMessage(f"Task {state.get('status', 'finished')}", 7000)
+        self.agent_status.setText(state.get("status", "Ready").title())
         if state.get("id"):
-            self.review_changes(state["id"])
             self.refresh_changes(state["id"])
         self._task_done()
 
     def on_failed(self, error: str):
-        self.activity.appendPlainText(f"[error] {error}")
+        self.activity.addTopLevelItem(QTreeWidgetItem(["Error: " + error[:240]]))
         QMessageBox.critical(self, "Task error", error)
         self._task_done()
+        self.agent_status.setText("Error")
 
     def _task_done(self):
         self.run_button.setEnabled(True)
@@ -1003,7 +1384,21 @@ class LunaWindow(QMainWindow):
             if choice != QMessageBox.Yes:
                 event.ignore()
                 return
+        dirty = [editor for editor in self.editor_tabs.file_paths if editor.document().isModified()]
+        if dirty:
+            answer = QMessageBox.question(self, "Unsaved files", "Save changes to open files before closing?",
+                                          QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
+                                          QMessageBox.Save)
+            if answer == QMessageBox.Cancel:
+                event.ignore()
+                return
+            if answer == QMessageBox.Save and not all(self.editor_tabs.save_editor(editor) for editor in dirty):
+                event.ignore()
+                return
         self.settings.setValue("window/geometry", self.saveGeometry())
+        self.settings.setValue("window/state", self.saveState())
+        self.settings.setValue("workspace/split", self.findChild(QSplitter, "workspace-splitter").sizes())
+        self.settings.setValue("workspace/chat_split", self.findChild(QSplitter, "editor-agent-splitter").sizes())
         self.terminal.shutdown()
         self.backend.stop()
         event.accept()
